@@ -4,19 +4,17 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
+import threading
+import time
 
 # Third Party
-from vllm.config import (
-    VllmConfig,
-)
+from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
 )
-from vllm.distributed.parallel_state import (
-    get_pp_group,
-)
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
@@ -278,6 +276,11 @@ class ReqMeta:
     disagg_spec: Optional[DisaggSpec] = None
     # the configs of the request
     request_configs: Optional[dict] = None
+    # Sage zero-copy: True if chunk blocks were transferred to this request
+    # When True, skip all loading/blending - KV is already in place
+    sage_blocks_transferred: bool = False
+    # Sage chunk boundary positions for GPU-direct blending (e.g., [0, 2770, 4615, ...])
+    sage_chunk_boundaries: Optional[list[int]] = None
 
     @staticmethod
     def from_request_tracker(
@@ -801,11 +804,75 @@ class LMCacheConnectorV1Impl:
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
-                    self.blender.blend(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
-                        kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                    start_time = time.time()
+                    logger.info(
+                        "Start blending %d tokens for request %s at time %.3f",
+                        lmcache_cached_tokens,
+                        request.req_id,
+                        start_time,
+                    )
+
+                    # SAGE ZERO-COPY: For requests with transferred blocks, always use
+                    # GPU-direct blending since KV is already in GPU paged memory
+                    # Also check env var for manual override
+                    use_gpu_blend = (
+                        request.sage_blocks_transferred and 
+                        os.environ.get("LMCACHE_SAGE_GPU_BLEND", "").lower() in ("1", "true", "yes")
+                    )
+
+                    if use_gpu_blend:
+                        logger.info(
+                            "[SAGE_BLEND] Using GPU-direct blending for request %s "
+                            "(sage_blocks_transferred=%s)",
+                            request.req_id,
+                            request.sage_blocks_transferred,
+                        )
+
+                        # Extract chunk boundaries from tokens using separator pattern
+                        # Default separator is "[SEP]" which typically tokenizes to a specific ID
+                        chunk_boundaries = None
+                        # Get chunk boundaries from request if available
+                        chunk_boundaries = getattr(
+                            request, "sage_chunk_boundaries", None
+                        )
+
+                        assert chunk_boundaries is not None, (
+                            "Sage GPU-direct blending requires chunk boundaries "
+                            "to be provided in request.sage_chunk_boundaries"
+                        )
+
+                        # No RoPE adjustment needed - Sage concurrent prefill already
+                        # computed KV cache with correct position_offset
+                        # For zero-copy requests, pass sage_zero_copy=True to retrieve ALL tokens
+                        # from GPU memory (not just what's in the token database)
+                        self.blender.blend_from_gpu(
+                            tokens[:lmcache_cached_tokens],
+                            token_mask[:lmcache_cached_tokens],
+                            chunk_boundaries=chunk_boundaries,
+                            kvcaches=kvcaches,
+                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                            sage_zero_copy=request.sage_blocks_transferred,
+                        )
+                    else:
+                        logger.info(
+                            "Using CPU-based blending for request %s",
+                            request.req_id,
+                        )
+                        self.blender.blend(
+                            tokens[:lmcache_cached_tokens],
+                            token_mask[:lmcache_cached_tokens],
+                            kvcaches=kvcaches,
+                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        )
+
+                    # Sync to get accurate timing - GPU ops are async
+                    end_time = time.time()
+                    logger.info(
+                        "Finished blending for request %s, at time %.3f, "
+                        "duration %.3f seconds",
+                        request.req_id,
+                        end_time,
+                        end_time - start_time,
                     )
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
@@ -1432,6 +1499,25 @@ class LMCacheConnectorV1Impl:
             )
             self._request_trackers[request.req_id] = request_tracker
 
+            # Check if this is a Sage zero-copy request
+            sage_blocks_transferred = getattr(request, 'sage_blocks_transferred', False)
+
+            # For zero-copy requests, we need to create a load_spec to trigger blending
+            # even though the KV is already in GPU memory (not CPU cache)
+            if sage_blocks_transferred and load_spec is None:
+                # Create a load_spec that indicates all tokens are "cached" and ready
+                # This will trigger the blending path in start_load_kv
+                prompt_len = len(request.prompt_token_ids)
+                load_spec = LoadSpec(
+                    vllm_cached_tokens=request.num_computed_tokens,
+                    lmcache_cached_tokens=prompt_len,
+                    can_load=True,  # Allow loading/blending
+                )
+                logger.info(
+                    f"[SAGE_ZERO_COPY] Created load_spec for {request.req_id}: "
+                    f"vllm_cached={request.num_computed_tokens}, lmcache_cached={prompt_len}"
+                )
+
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
                 self._block_size,
@@ -1441,6 +1527,16 @@ class LMCacheConnectorV1Impl:
                 save_decode_cache=self._save_decode_cache,
             )
             if req_meta is not None:
+                if sage_blocks_transferred:
+                    req_meta.sage_blocks_transferred = True
+                    # Also copy chunk boundaries for GPU-direct blending
+                    req_meta.sage_chunk_boundaries = getattr(
+                        request, "sage_chunk_boundaries", None
+                    )
+                    logger.info(
+                        f"[SAGE_ZERO_COPY] Request {request.req_id} marked for GPU-direct blending, "
+                        f"chunk_boundaries={req_meta.sage_chunk_boundaries}"
+                    )
                 meta.add_request(req_meta)
 
         cached_reqs = scheduler_output.scheduled_cached_reqs

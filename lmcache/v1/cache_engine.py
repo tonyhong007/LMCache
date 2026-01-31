@@ -916,6 +916,17 @@ class LMCacheEngine:
             ret_mask[start:end] = True
 
         if keys:
+            # Timing tracking for pipelining analysis
+            # Use CUDA events for GPU timing (less intrusive) + perf_counter for CPU timing
+            retrieve_start_time = time.perf_counter()
+            per_layer_get_task_times = []  # Time to get task from generator (async submission) - CPU
+            per_layer_yield_times = []  # Time spent yielded (caller processing - compute_layer) - GPU
+            per_layer_result_times = []  # Time to wait for task.result() (storage retrieval) - CPU
+            per_layer_send_times = []  # Time to send to GPU consumer (CPU->GPU transfer) - GPU
+            per_layer_yield_events = []  # CUDA events for yield timing
+            per_layer_send_events = []  # CUDA events for send timing
+            total_cpu_time = 0.0
+
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
@@ -932,24 +943,64 @@ class LMCacheEngine:
                     SGLangLayerwiseGPUConnector,
                 ),
             )
+            
+            # Init timing with CUDA events
+            init_start = torch.cuda.Event(enable_timing=True)
+            init_end = torch.cuda.Event(enable_timing=True)
+            init_start.record()
+            t_init = time.perf_counter()
             mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
             next(mem_obj_consumer)
+            init_end.record()
+            init_cpu_time = time.perf_counter() - t_init
+            total_cpu_time += init_cpu_time
 
             to_count_down = []
             for layer_id in range(self.num_layers):
+                # Time: get task from generator (async retrieval submission)
+                # This submits the async fetch request, doesn't wait for completion - CPU only
+                t_get_task = time.perf_counter()
                 task = next(get_generator)
+                get_task_time = time.perf_counter() - t_get_task
+                per_layer_get_task_times.append(get_task_time)
+                total_cpu_time += get_task_time
 
                 assert task is not None
 
+                # Yield to caller (for compute_layer to run in blend_layer)
+                # This is where the caller (blend_layer) runs compute_layer - GPU work
+                yield_start = torch.cuda.Event(enable_timing=True)
+                yield_end = torch.cuda.Event(enable_timing=True)
+                yield_start.record()
+                t_before_yield = time.perf_counter()
                 if layer_id == 0:
                     # NOTE(Yuwei): For sglang integration we need to provide retrieved
                     # tokens number in the first layer loading since there is no lookup
                     yield torch.sum(ret_mask)
                 else:
                     yield None
+                yield_end.record()
+                yield_cpu_time = time.perf_counter() - t_before_yield
+                per_layer_yield_events.append((yield_start, yield_end))
 
+                # Time: wait for task.result() (storage retrieval completion)
+                # This waits for the CPU storage to complete - CPU only
+                t_result = time.perf_counter()
                 mem_objs_layer = task.result()
+                result_time = time.perf_counter() - t_result
+                per_layer_result_times.append(result_time)
+                total_cpu_time += result_time
+
+                # Time: send to GPU consumer (CPU->GPU transfer + RoPE + buffer->paged)
+                send_start = torch.cuda.Event(enable_timing=True)
+                send_end = torch.cuda.Event(enable_timing=True)
+                send_start.record()
+                t_send = time.perf_counter()
                 mem_obj_consumer.send(mem_objs_layer)
+                send_end.record()
+                send_cpu_time = time.perf_counter() - t_send
+                per_layer_send_events.append((send_start, send_end))
+
                 to_count_down.extend(mem_objs_layer)
 
             for mem_obj in to_count_down:
@@ -962,8 +1013,118 @@ class LMCacheEngine:
 
         yield None
 
-        # synchronize the last layer
+        # Final sync timing with CUDA events
+        sync_start = torch.cuda.Event(enable_timing=True)
+        sync_end = torch.cuda.Event(enable_timing=True)
+        sync_start.record()
+        t_sync = time.perf_counter()
         next(mem_obj_consumer)
+        sync_end.record()
+        sync_cpu_time = time.perf_counter() - t_sync
+        total_cpu_time += sync_cpu_time
+
+        # Synchronize once at the end to read all event timings
+        torch.cuda.synchronize()
+        retrieve_end_time = time.perf_counter()
+        total_wall_time = retrieve_end_time - retrieve_start_time
+        
+        # Extract GPU timings from events (in milliseconds)
+        init_time = init_start.elapsed_time(init_end)
+        sync_time = sync_start.elapsed_time(sync_end)
+        
+        # Extract per-layer GPU times
+        per_layer_yield_times = []
+        per_layer_send_times = []
+        for (yield_start, yield_end), (send_start, send_end) in zip(
+            per_layer_yield_events, per_layer_send_events, strict=False
+        ):
+            per_layer_yield_times.append(yield_start.elapsed_time(yield_end))
+            per_layer_send_times.append(send_start.elapsed_time(send_end))
+        
+        # Log per-layer details
+        for layer_id in range(len(per_layer_get_task_times)):
+            logger.info(
+                f"[RETRIEVE_LAYER_TIMING] Layer {layer_id}: "
+                f"get_task={per_layer_get_task_times[layer_id]*1000:.3f}ms (CPU), "
+                f"yield (caller compute)={per_layer_yield_times[layer_id]:.3f}ms (GPU), "
+                f"result_wait (storage)={per_layer_result_times[layer_id]*1000:.3f}ms (CPU), "
+                f"send_to_gpu={per_layer_send_times[layer_id]:.3f}ms (GPU)"
+            )
+        
+        logger.info(f"[RETRIEVE_LAYER_TIMING] init (batched_to_gpu setup): {init_time:.3f}ms (GPU)")
+        logger.info(f"[RETRIEVE_LAYER_TIMING] final_sync: {sync_time:.3f}ms (GPU)")
+
+        # Log summary with pipelining bottleneck analysis
+        if keys and per_layer_get_task_times:
+            total_gpu_time = init_time + sync_time + sum(per_layer_yield_times) + sum(per_layer_send_times)
+            logger.info(
+                f"[RETRIEVE_LAYER_TIMING] SUMMARY: "
+                f"total_wall_time={total_wall_time*1000:.3f}ms, "
+                f"total_gpu_time={total_gpu_time:.3f}ms, "
+                f"total_cpu_time={total_cpu_time*1000:.3f}ms, "
+                f"init={init_time:.3f}ms, "
+                f"final_sync={sync_time:.3f}ms"
+            )
+
+            # Per-stage statistics (convert CPU times to ms for comparison)
+            avg_get_task = sum(per_layer_get_task_times) / len(per_layer_get_task_times) * 1000
+            max_get_task = max(per_layer_get_task_times) * 1000
+            max_get_task_layer = per_layer_get_task_times.index(max(per_layer_get_task_times))
+
+            avg_result = sum(per_layer_result_times) / len(per_layer_result_times) * 1000
+            max_result = max(per_layer_result_times) * 1000
+            max_result_layer = per_layer_result_times.index(max(per_layer_result_times))
+
+            avg_send = sum(per_layer_send_times) / len(per_layer_send_times)
+            max_send = max(per_layer_send_times)
+            max_send_layer = per_layer_send_times.index(max_send)
+
+            avg_yield = sum(per_layer_yield_times) / len(per_layer_yield_times)
+            max_yield = max(per_layer_yield_times)
+            max_yield_layer = per_layer_yield_times.index(max_yield)
+
+            logger.info(
+                f"[RETRIEVE_LAYER_TIMING] STAGE STATS: "
+                f"get_task (CPU): avg={avg_get_task:.3f}ms, max={max_get_task:.3f}ms (layer {max_get_task_layer}); "
+                f"result_wait (CPU): avg={avg_result:.3f}ms, max={max_result:.3f}ms (layer {max_result_layer}); "
+                f"send_to_gpu (GPU): avg={avg_send:.3f}ms, max={max_send:.3f}ms (layer {max_send_layer}); "
+                f"yield/compute (GPU): avg={avg_yield:.3f}ms, max={max_yield:.3f}ms (layer {max_yield_layer})"
+            )
+
+            # Identify per-layer bottleneck (all times in ms)
+            per_layer_bottlenecks = []
+            for i in range(len(per_layer_get_task_times)):
+                layer_stages = [
+                    ("get_task", per_layer_get_task_times[i] * 1000),
+                    ("result_wait", per_layer_result_times[i] * 1000),
+                    ("send_to_gpu", per_layer_send_times[i]),
+                    ("yield", per_layer_yield_times[i]),
+                ]
+                bottleneck_name, bottleneck_time = max(layer_stages, key=lambda x: x[1])
+                per_layer_bottlenecks.append((bottleneck_name, bottleneck_time))
+
+            # Find overall bottleneck
+            all_stages = [
+                ("init", init_time),
+                ("max_get_task", max_get_task),
+                ("max_result_wait", max_result),
+                ("max_send_to_gpu", max_send),
+                ("max_yield", max_yield),
+                ("final_sync", sync_time),
+            ]
+            overall_bottleneck_name, overall_bottleneck_time = max(all_stages, key=lambda x: x[1])
+            logger.info(
+                f"[RETRIEVE_LAYER_TIMING] OVERALL BOTTLENECK: "
+                f"{overall_bottleneck_name}={overall_bottleneck_time:.3f}ms"
+            )
+
+            # Show per-layer bottleneck distribution
+            bottleneck_counts = {}
+            for name, _ in per_layer_bottlenecks:
+                bottleneck_counts[name] = bottleneck_counts.get(name, 0) + 1
+            logger.info(
+                f"[RETRIEVE_LAYER_TIMING] PER-LAYER BOTTLENECK DISTRIBUTION: {bottleneck_counts}"
+            )
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
@@ -974,6 +1135,231 @@ class LMCacheEngine:
         )
 
         yield ret_mask
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def retrieve_layer_from_gpu(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Generator[None, None, None]:
+        """
+        Retrieve KV cache directly from GPU paged memory in a layerwise manner.
+        This is optimized for Sage concurrent prefill where the KV cache is already
+        computed and stored in GPU paged memory, avoiding CPU round-trip overhead.
+
+        Unlike retrieve_layer which fetches from CPU storage backends, this reads
+        directly from the GPU paged memory using batched_from_gpu_to_buffer.
+
+        :param torch.Tensor tokens: The tokens of the corresponding KV caches.
+
+        :param Optional[torch.Tensor] mask: The mask for the tokens. Should
+            have the same length as tokens. And the mask should ALWAYS be like
+            FFFFFTTTTTTT, where True means the tokens needs to be matched.
+
+        :param **kwargs: The additional arguments including:
+            - kvcaches: The paged GPU memory KV caches
+            - slot_mapping: The slot mapping for the tokens
+
+        return: A generator that yields None. In each iteration, it reads one
+            layer's KV cache from paged GPU memory into the internal buffer,
+            applies RoPE adjustment, and after blending (done by caller),
+            writes the blended data back to paged memory.
+        """
+        assert (
+            self.gpu_connector is not None
+        ), "gpu_connector is required for retrieve_layer_from_gpu operation"
+
+        if mask is not None:
+            num_required_tokens = torch.sum(mask).item()
+        else:
+            num_required_tokens = len(tokens)
+
+        starts = []
+        ends = []
+
+        request_configs = kwargs.get("request_configs")
+        if request_configs is not None and len(request_configs) != 0:
+            assert isinstance(request_configs, dict)
+
+        # SAGE ZERO-COPY: For requests where KV was transferred directly from chunks,
+        # we need to retrieve ALL tokens from GPU memory (not just what's in token database)
+        # The token database tracks CPU cache, but for zero-copy the data is only in GPU
+        sage_zero_copy = kwargs.get("sage_zero_copy", False)
+        
+        assert sage_zero_copy == False (
+            "sage_zero_copy flag must be provided in kwargs for "
+            "retrieve_layer_from_gpu operation"
+        )
+
+        # For zero-copy requests, use full token range (0 to len(tokens))
+        # The KV is already in GPU paged memory from chunk prefilling
+        starts = [0]
+        ends = [len(tokens)]
+        logger.info(
+            f"[GPU-direct] SAGE_ZERO_COPY: Using full token range [0, {len(tokens)}]"
+        )
+
+        if starts:
+            assert isinstance(
+                self.gpu_connector,
+                VLLMBufferLayerwiseGPUConnector,
+            ), "retrieve_layer_from_gpu requires VLLMBufferLayerwiseGPUConnector"
+
+            # Use CUDA events for accurate GPU timing (less intrusive than synchronize)
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            start_time = time.perf_counter()
+            start_event.record()
+            logger.info(
+                f"[GPU-direct] Start layerwise retrieve from GPU for {len(tokens)} tokens "
+                f"across {self.num_layers} layers"
+            )
+
+            # Timing tracking for pipelining analysis using CUDA events
+            per_layer_events = []  # List of (start_event, end_event) tuples
+            per_layer_read_times = []  # Time for reading layer from paged memory
+            per_layer_write_times = []  # Time for writing previous layer back
+
+            # Use batched_from_gpu_to_buffer instead of batched_to_gpu
+            gpu_buffer_reader = self.gpu_connector.batched_from_gpu_to_buffer(
+                starts, ends, **kwargs
+            )
+
+            # First yield: preparation
+            init_start = torch.cuda.Event(enable_timing=True)
+            init_end = torch.cuda.Event(enable_timing=True)
+            init_start.record()
+            next(gpu_buffer_reader)
+            init_end.record()
+            yield
+
+            for layer_id in range(self.num_layers):
+                # Read layer from paged GPU memory (and write previous layer back)
+                # The GPU connector does:
+                #   - If layer_id > 0: write layer (layer_id-1) back to paged memory
+                #   - If layer_id < num_layers: read layer_id from paged memory
+                layer_start = torch.cuda.Event(enable_timing=True)
+                layer_end = torch.cuda.Event(enable_timing=True)
+                layer_start.record()
+                next(gpu_buffer_reader)
+                layer_end.record()
+                per_layer_events.append((layer_start, layer_end))
+                yield
+
+            # Write the last layer back to paged memory
+            write_last_start = torch.cuda.Event(enable_timing=True)
+            write_last_end = torch.cuda.Event(enable_timing=True)
+            write_last_start.record()
+            next(gpu_buffer_reader)
+            write_last_end.record()
+
+            # Final cleanup
+            cleanup_start = torch.cuda.Event(enable_timing=True)
+            cleanup_end = torch.cuda.Event(enable_timing=True)
+            cleanup_start.record()
+            next(gpu_buffer_reader)
+            cleanup_end.record()
+            
+            end_event.record()
+
+            # Synchronize once at the end to read all event timings
+            torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            total_wall_time = end_time - start_time
+            
+            # Extract GPU timings from events (in milliseconds)
+            init_time = init_start.elapsed_time(init_end)
+            write_last_time = write_last_start.elapsed_time(write_last_end)
+            cleanup_time = cleanup_start.elapsed_time(cleanup_end)
+            total_gpu_time = start_event.elapsed_time(end_event)
+            
+            # Extract per-layer times
+            per_layer_times = []
+            total_time_in_generator = init_time + write_last_time + cleanup_time
+            for layer_id, (layer_start, layer_end) in enumerate(per_layer_events):
+                layer_time = layer_start.elapsed_time(layer_end)
+                per_layer_times.append(layer_time)
+                total_time_in_generator += layer_time
+                
+                # Track read/write breakdown for pipelining analysis
+                if layer_id == 0:
+                    # First layer: only read, no write of previous layer
+                    per_layer_read_times.append(layer_time)
+                    per_layer_write_times.append(0.0)
+                    logger.info(
+                        f"[RETRIEVE_GPU_TIMING] Layer {layer_id}: "
+                        f"read_only={layer_time:.3f}ms (first layer, no prev write)"
+                    )
+                else:
+                    # Subsequent layers: write prev + read curr (pipelined)
+                    per_layer_read_times.append(layer_time)
+                    per_layer_write_times.append(layer_time)
+                    logger.info(
+                        f"[RETRIEVE_GPU_TIMING] Layer {layer_id}: "
+                        f"write_prev+read_curr={layer_time:.3f}ms (pipelined)"
+                    )
+            
+            logger.info(f"[RETRIEVE_GPU_TIMING] init (prep): {init_time:.3f}ms")
+            logger.info(f"[RETRIEVE_GPU_TIMING] write_last_layer: {write_last_time:.3f}ms")
+            logger.info(f"[RETRIEVE_GPU_TIMING] cleanup: {cleanup_time:.3f}ms")
+
+            # Log summary with bottleneck analysis
+            logger.info(
+                f"[RETRIEVE_GPU_TIMING] SUMMARY: "
+                f"total_wall_time={total_wall_time*1000:.3f}ms, "
+                f"total_gpu_time={total_gpu_time:.3f}ms, "
+                f"total_in_generator={total_time_in_generator:.3f}ms, "
+                f"init={init_time:.3f}ms, "
+                f"write_last={write_last_time:.3f}ms, "
+                f"cleanup={cleanup_time:.3f}ms"
+            )
+            if per_layer_times:
+                max_layer_time = max(per_layer_times)
+                max_layer_idx = per_layer_times.index(max_layer_time)
+                min_layer_time = min(per_layer_times)
+                min_layer_idx = per_layer_times.index(min_layer_time)
+                avg_layer_time = sum(per_layer_times) / len(per_layer_times)
+                logger.info(
+                    f"[RETRIEVE_GPU_TIMING] LAYER STATS: "
+                    f"max={max_layer_time:.3f}ms (layer {max_layer_idx}), "
+                    f"min={min_layer_time:.3f}ms (layer {min_layer_idx}), "
+                    f"avg={avg_layer_time:.3f}ms, "
+                    f"total_layers={len(per_layer_times)}"
+                )
+                # Identify bottleneck across all stages
+                all_stages = [
+                    ("init", init_time),
+                    (f"layer_{max_layer_idx}_read_write", max_layer_time),
+                    ("write_last", write_last_time),
+                    ("cleanup", cleanup_time),
+                ]
+                bottleneck_name, bottleneck_time = max(all_stages, key=lambda x: x[1])
+                logger.info(
+                    f"[RETRIEVE_GPU_TIMING] BOTTLENECK: "
+                    f"{bottleneck_name}={bottleneck_time:.3f}ms"
+                )
+                
+                # Show pipelining efficiency
+                total_read_time = sum(per_layer_read_times)
+                total_write_time = sum(per_layer_write_times[1:])  # Exclude first layer (no prev write)
+                logger.info(
+                    f"[RETRIEVE_GPU_TIMING] PIPELINE ANALYSIS: "
+                    f"total_reads={total_read_time:.3f}ms, "
+                    f"total_writes={total_write_time:.3f}ms (overlapped with reads)"
+                )
+        else:
+            # If no tokens to process, still yield to avoid StopIteration
+            for layer_id in range(self.num_layers):
+                yield
+
+        logger.info(
+            f"[GPU-direct] Retrieved {num_required_tokens} tokens from GPU paged memory"
+        )
+
+        yield
 
     @_lmcache_nvtx_annotate
     def lookup(
@@ -1787,9 +2173,7 @@ class LMCacheEngineBuilder:
         if enable_nixl_storage:
             # TODO(Jiayi): weird to import from transfer utils.
             # First Party
-            from lmcache.v1.transfer_channel.transfer_utils import (
-                get_correct_device,
-            )
+            from lmcache.v1.transfer_channel.transfer_utils import get_correct_device
 
             corrected_device = get_correct_device(
                 config.nixl_buffer_device,

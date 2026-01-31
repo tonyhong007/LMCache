@@ -13,6 +13,18 @@ logger = init_logger(__name__)
 
 def infer_model_from_vllm(vllm_model, blender, enable_sparse: bool = False):
     model_name = type(vllm_model).__name__
+
+    # Handle multimodal models that wrap a language model
+    # Check if the model has a get_language_model method (e.g., PixtralForConditionalGeneration)
+    if hasattr(vllm_model, "get_language_model"):
+        language_model = vllm_model.get_language_model()
+        logger.info(
+            f"Extracting language model from multimodal model {model_name}: "
+            f"{type(language_model).__name__}"
+        )
+        # Recursively infer the language model
+        return infer_model_from_vllm(language_model, blender, enable_sparse)
+
     if model_name == "LlamaForCausalLM":
         # First Party
         from lmcache.v1.compute.models.llama import LMCLlamaModel

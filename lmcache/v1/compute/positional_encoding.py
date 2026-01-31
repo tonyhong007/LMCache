@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, Optional
 # Third Party
 from vllm.model_executor.layers.rotary_embedding import get_rope as vllm_get_rope
 import torch
+import time
 
 # First Party
 from lmcache.logging import init_logger
@@ -171,15 +172,18 @@ def get_fused_rope(
         )
         return None
 
+    rope_parameters = {
+        "rope_type": "default",
+        "rope_theta": base,
+        "partial_rotary_factor": partial_rotary_factor,
+    }
+
     rope = vllm_get_rope(
         head_size,
-        rotary_dim,
         max_position,
-        base,
-        is_neox_style,
-        rope_scaling,
-        dtype,
-        partial_rotary_factor,
+        is_neox_style=is_neox_style,
+        rope_parameters=rope_parameters,
+        dtype=dtype,
     )
 
     reverse_rope = BasicReverseRope(rope, rotary_dim, is_neox_style)

@@ -69,7 +69,7 @@ class LMCBaseModel(nn.Module, ABC):
         input_ids: torch.Tensor,
     ):
         input_ids = input_ids.cuda()
-        hidden_states = self.vllm_model.get_input_embeddings(input_ids)
+        hidden_states = self.vllm_model.embed_input_ids(input_ids)
         residual = None
 
         attn_output = None
