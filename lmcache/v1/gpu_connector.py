@@ -2,8 +2,10 @@
 # Standard
 from typing import List, Optional, Tuple, Union
 import abc
+import os
 
 # Third Party
+import numpy as np
 import torch
 import time
 
@@ -15,6 +17,7 @@ from lmcache.utils import _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.compute.positional_encoding import PagedRopeInplace
 
 if torch.cuda.is_available():
     # First Party
@@ -578,6 +581,17 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         self.gpu_buffer_allocator = None
         self.element_size = torch.tensor([], dtype=self.dtype).element_size()
 
+        # Debug/timing switches for Sage paths.
+        self.enable_gpu_timing = os.getenv("SAGE_ENABLE_TIMING", "0").lower() == "1"
+        
+        # Cached bulk buffer for batched_from_gpu_to_buffer (GPU-direct path)
+        # Pre-allocated to avoid allocation overhead on each request
+        self._cached_bulk_buffer: Optional[torch.Tensor] = None
+        self._cached_bulk_buffer_tokens: int = 0  # Current capacity in tokens
+        
+        # In-place RoPE object for GPU-direct path (no intermediate buffer needed!)
+        self._paged_rope_inplace: Optional[PagedRopeInplace] = None
+
     @classmethod
     def from_metadata(
         cls,
@@ -648,6 +662,49 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             self.gpu_buffer_allocator = GPUMemoryAllocator(
                 gpu_buffer_size, device=self.device
             )
+            
+            # Pre-warm PagedRopeInplace to avoid lazy init overhead on first request
+            self._prewarm_paged_rope_inplace(self.device)
+    
+    def _prewarm_paged_rope_inplace(self, device):
+        """Pre-warm PagedRopeInplace and transfer cos_sin_cache to GPU.
+        
+        This avoids ~15-20ms overhead on first request due to:
+        1. LMCBlenderBuilder.get() lazy initialization
+        2. cos_sin_cache.to(device) CPU→GPU transfer (~10MB)
+        """
+        if self._paged_rope_inplace is not None:
+            return  # Already initialized
+            
+        try:
+            timing_enabled = self.enable_gpu_timing
+            if timing_enabled:
+                t0 = time.perf_counter()
+            lmc_model = LMCBlenderBuilder.get(ENGINE_NAME).layerwise_model
+            if lmc_model.fused_rotary_emb is not None:
+                self._paged_rope_inplace = PagedRopeInplace(
+                    lmc_model.fused_rotary_emb.rope,
+                    lmc_model.fused_rotary_emb.is_neox_style,
+                )
+                # Pre-transfer cos_sin_cache to GPU
+                cos_sin_cache = self._paged_rope_inplace.cos_sin_cache
+                self._paged_rope_inplace._cos_sin_cache_device = cos_sin_cache.to(device)
+                cache_size_mb = (
+                    cos_sin_cache.numel() * cos_sin_cache.element_size() / 1024 / 1024
+                )
+                if timing_enabled:
+                    t1 = time.perf_counter()
+                    logger.info(
+                        f"[GPU_DIRECT] Pre-warmed PagedRopeInplace in {(t1-t0)*1000:.2f}ms, "
+                        f"cos_sin_cache={cache_size_mb:.1f}MB transferred to {device}"
+                    )
+                else:
+                    logger.info(
+                        f"[GPU_DIRECT] Pre-warmed PagedRopeInplace, "
+                        f"cos_sin_cache={cache_size_mb:.1f}MB transferred to {device}"
+                    )
+        except Exception as e:
+            logger.warning(f"[GPU_DIRECT] Failed to pre-warm PagedRopeInplace: {e}")
 
     def get_kv(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -748,18 +805,11 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
             old_positions_full = torch.zeros(
                 (num_all_tokens,), dtype=torch.int64, device=self.kvcaches[0].device
             )
-        
-        # Timing tracking for detailed profiling
-        # We track events on both streams to properly measure pipelined operations:
-        # - load_stream: CPU->GPU copy (runs in parallel)
-        # - default stream: RoPE + buffer->paged transfer
-        per_layer_copy_events = []  # (layer_id, start, end) - on load_stream
-        per_layer_rope_events = []  # (layer_id, start, end) - on default stream
-        per_layer_paged_events = []  # (layer_id, start, end) - on default stream
-        per_layer_gap_zero_events = []  # (layer_id, start, end) - on default stream
-        # Track pipeline stage times to identify bottleneck
-        # Each iteration: copy[i] runs parallel to (paged[i-2] + rope[i-1])
-        pipeline_analysis = []  # (layer_id, copy_time, default_stream_time, bottleneck)
+
+        per_layer_copy_events = []
+        per_layer_rope_events = []
+        per_layer_paged_events = []
+        per_layer_gap_zero_events = []
         
         # Track the previous copy end event to measure pipeline overlap
         prev_copy_end_event = None
@@ -767,12 +817,10 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         for layer_id in range(self.num_layers + 2):
             # === DEFAULT STREAM WORK ===
             # Buffer -> paged memory transfer (for layer i-2)
-            paged_start_event = None
-            paged_end_event = None
             if layer_id > 1:
-                paged_start_event = torch.cuda.Event(enable_timing=True)
-                paged_end_event = torch.cuda.Event(enable_timing=True)
-                paged_start_event.record()
+                if self.enable_gpu_timing:
+                    paged_start_event = torch.cuda.Event(enable_timing=True)
+                    paged_start_event.record()
                 lmc_ops.single_layer_kv_transfer(
                     self.buffer_mapping[layer_id - 2].tensor,
                     self.kvcaches[layer_id - 2],
@@ -782,19 +830,21 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     self.vllm_two_major,
                     self.use_mla,
                 )
-                paged_end_event.record()
                 del self.buffer_mapping[layer_id - 2]
-                per_layer_paged_events.append((layer_id - 2, paged_start_event, paged_end_event))
+                if self.enable_gpu_timing:
+                    paged_end_event = torch.cuda.Event(enable_timing=True)
+                    paged_end_event.record()
+                    per_layer_paged_events.append(
+                        (layer_id - 2, paged_start_event, paged_end_event)
+                    )
 
                 logger.debug(f"Finished loading layer {layer_id - 2} into paged memory")
 
-            rope_start_event = None
-            rope_end_event = None
-            gap_start_event = None
-            gap_end_event = None
             if layer_id > 0 and layer_id <= self.num_layers:
-                # NOTE: wait until both compute and load streams are done
-                torch.cuda.synchronize()
+                # Wait only for the corresponding copy stage instead of globally
+                # synchronizing the device.
+                if prev_copy_end_event is not None:
+                    torch.cuda.current_stream().wait_event(prev_copy_end_event)
 
                 # ping-pong the buffers
                 compute_gpu_buffer_obj, load_gpu_buffer_obj = (
@@ -805,25 +855,33 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 if self.cache_positions:
                     assert compute_gpu_buffer_obj.tensor is not None
 
-                    rope_start_event = torch.cuda.Event(enable_timing=True)
-                    rope_end_event = torch.cuda.Event(enable_timing=True)
-                    rope_start_event.record()
+                    if self.enable_gpu_timing:
+                        rope_start_event = torch.cuda.Event(enable_timing=True)
+                        rope_start_event.record()
                     compute_gpu_buffer_obj.tensor[0] = self.fused_rotary_emb(
                         old_positions_full,
                         new_positions_full,
                         compute_gpu_buffer_obj.tensor[0],
                     )
-                    rope_end_event.record()
-                    per_layer_rope_events.append((layer_id - 1, rope_start_event, rope_end_event))
+                    if self.enable_gpu_timing:
+                        rope_end_event = torch.cuda.Event(enable_timing=True)
+                        rope_end_event.record()
+                        per_layer_rope_events.append(
+                            (layer_id - 1, rope_start_event, rope_end_event)
+                        )
 
                 # gap zeroing after RoPE
                 if self.current_gap_positions.numel():
-                    gap_start_event = torch.cuda.Event(enable_timing=True)
-                    gap_end_event = torch.cuda.Event(enable_timing=True)
-                    gap_start_event.record()
+                    if self.enable_gpu_timing:
+                        gap_start_event = torch.cuda.Event(enable_timing=True)
+                        gap_start_event.record()
                     compute_gpu_buffer_obj.tensor[:, self.current_gap_positions] = 0.0
-                    gap_end_event.record()
-                    per_layer_gap_zero_events.append((layer_id - 1, gap_start_event, gap_end_event))
+                    if self.enable_gpu_timing:
+                        gap_end_event = torch.cuda.Event(enable_timing=True)
+                        gap_end_event.record()
+                        per_layer_gap_zero_events.append(
+                            (layer_id - 1, gap_start_event, gap_end_event)
+                        )
 
                 self.buffer_mapping[layer_id - 1] = compute_gpu_buffer_obj
 
@@ -834,11 +892,12 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                 memory_objs_layer = yield
 
                 # memobj -> gpu_buffer (CPU -> GPU copy) - on load_stream
-                copy_start_event = torch.cuda.Event(enable_timing=True)
-                copy_end_event = torch.cuda.Event(enable_timing=True)
+                copy_end_event = torch.cuda.Event(enable_timing=False)
                 
                 with torch.cuda.stream(self.load_stream):
-                    copy_start_event.record(self.load_stream)
+                    if self.enable_gpu_timing:
+                        copy_start_event = torch.cuda.Event(enable_timing=True)
+                        copy_start_event.record(self.load_stream)
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
                     ):
@@ -857,119 +916,57 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                                 start - buf_offset : end - buf_offset
                             ] = memory_obj.metadata.cached_positions
                     copy_end_event.record(self.load_stream)
-                
-                per_layer_copy_events.append((layer_id, copy_start_event, copy_end_event))
+                if self.enable_gpu_timing:
+                    per_layer_copy_events.append(
+                        (layer_id, copy_start_event, copy_end_event)
+                    )
                 prev_copy_end_event = copy_end_event
 
             elif layer_id == self.num_layers:
                 yield
-        
-        # Synchronize and extract all timings at the end
-        torch.cuda.synchronize()
-        
-        # Extract timing data
-        copy_times = {}  # layer_id -> time_ms
-        for layer_id, start_evt, end_evt in per_layer_copy_events:
-            copy_times[layer_id] = start_evt.elapsed_time(end_evt)
-        
-        rope_times = {}  # layer_id -> time_ms
-        for layer_id, start_evt, end_evt in per_layer_rope_events:
-            rope_times[layer_id] = start_evt.elapsed_time(end_evt)
-        
-        paged_times = {}  # layer_id -> time_ms  
-        for layer_id, start_evt, end_evt in per_layer_paged_events:
-            paged_times[layer_id] = start_evt.elapsed_time(end_evt)
-        
-        gap_zero_times = {}  # layer_id -> time_ms
-        for layer_id, start_evt, end_evt in per_layer_gap_zero_events:
-            gap_zero_times[layer_id] = start_evt.elapsed_time(end_evt)
-        
-        # Calculate totals
-        total_copy_time = sum(copy_times.values())
-        total_rope_time = sum(rope_times.values())
-        total_paged_time = sum(paged_times.values())
-        total_gap_zero_time = sum(gap_zero_times.values())
-        
-        # Analyze pipeline: at sync point after layer i's default stream work,
-        # we wait for: copy[i] vs (rope[i] + paged[i-1])
-        # The bottleneck determines if copy or default-stream work dominates
-        copy_bottleneck_count = 0
-        default_stream_bottleneck_count = 0
-        copy_dominant_layers = []
-        default_dominant_layers = []
-        
-        for layer_id in range(self.num_layers):
-            copy_time = copy_times.get(layer_id, 0)
-            # Default stream does: paged[layer_id-1] then rope[layer_id]
-            # But paged happens BEFORE sync, rope happens AFTER sync
-            # So at the sync point, we compare:
-            # - Previous iteration's copy (which ran parallel to this iteration's paged+rope)
-            # The actual comparison should be: copy[i-1] vs (paged[i-2] + rope[i-1])
-            
-            # For simplicity, we compare individual operations
-            rope_time = rope_times.get(layer_id, 0)
-            
-            if copy_time > rope_time:
-                copy_bottleneck_count += 1
-                copy_dominant_layers.append(layer_id)
-            else:
-                default_stream_bottleneck_count += 1
-                default_dominant_layers.append(layer_id)
-        
-        # Log summary
-        logger.info(
-            f"[GPU_CONNECTOR_TIMING] batched_to_gpu SUMMARY: "
-            f"total_copy(load_stream)={total_copy_time:.3f}ms, "
-            f"total_rope(default_stream)={total_rope_time:.3f}ms, "
-            f"total_paged(default_stream)={total_paged_time:.3f}ms, "
-            f"total_gap_zero={total_gap_zero_time:.3f}ms"
-        )
-        
-        copy_times_list = list(copy_times.values())
-        rope_times_list = list(rope_times.values())
-        paged_times_list = list(paged_times.values())
-        
-        if copy_times_list:
+
+        if self.enable_gpu_timing:
+            torch.cuda.synchronize()
+            copy_times = {
+                layer_id: start_evt.elapsed_time(end_evt)
+                for layer_id, start_evt, end_evt in per_layer_copy_events
+            }
+            rope_times = {
+                layer_id: start_evt.elapsed_time(end_evt)
+                for layer_id, start_evt, end_evt in per_layer_rope_events
+            }
+            paged_times = {
+                layer_id: start_evt.elapsed_time(end_evt)
+                for layer_id, start_evt, end_evt in per_layer_paged_events
+            }
+            gap_zero_times = {
+                layer_id: start_evt.elapsed_time(end_evt)
+                for layer_id, start_evt, end_evt in per_layer_gap_zero_events
+            }
+            total_copy_time = sum(copy_times.values())
+            total_rope_time = sum(rope_times.values())
+            total_paged_time = sum(paged_times.values())
+            total_gap_zero_time = sum(gap_zero_times.values())
+            copy_bottleneck_count = 0
+            default_stream_bottleneck_count = 0
+            for layer_id in range(self.num_layers):
+                copy_time = copy_times.get(layer_id, 0)
+                rope_time = rope_times.get(layer_id, 0)
+                if copy_time > rope_time:
+                    copy_bottleneck_count += 1
+                else:
+                    default_stream_bottleneck_count += 1
             logger.info(
-                f"[GPU_CONNECTOR_TIMING] CPU->GPU copy (load_stream): "
-                f"avg={sum(copy_times_list)/len(copy_times_list):.3f}ms, "
-                f"max={max(copy_times_list):.3f}ms, "
-                f"min={min(copy_times_list):.3f}ms"
+                f"[GPU_CONNECTOR_TIMING] batched_to_gpu SUMMARY: "
+                f"total_copy(load_stream)={total_copy_time:.3f}ms, "
+                f"total_rope(default_stream)={total_rope_time:.3f}ms, "
+                f"total_paged(default_stream)={total_paged_time:.3f}ms, "
+                f"total_gap_zero={total_gap_zero_time:.3f}ms"
             )
-        if rope_times_list:
             logger.info(
-                f"[GPU_CONNECTOR_TIMING] RoPE adjustment (default_stream): "
-                f"avg={sum(rope_times_list)/len(rope_times_list):.3f}ms, "
-                f"max={max(rope_times_list):.3f}ms, "
-                f"min={min(rope_times_list):.3f}ms"
-            )
-        if paged_times_list:
-            logger.info(
-                f"[GPU_CONNECTOR_TIMING] Buffer->paged (default_stream): "
-                f"avg={sum(paged_times_list)/len(paged_times_list):.3f}ms, "
-                f"max={max(paged_times_list):.3f}ms, "
-                f"min={min(paged_times_list):.3f}ms"
-            )
-        
-        # Pipeline bottleneck analysis
-        logger.info(
-            f"[GPU_CONNECTOR_TIMING] PIPELINE ANALYSIS: "
-            f"copy_bottleneck={copy_bottleneck_count} layers, "
-            f"rope_bottleneck={default_stream_bottleneck_count} layers"
-        )
-        if copy_bottleneck_count > default_stream_bottleneck_count:
-            logger.info(
-                f"[GPU_CONNECTOR_TIMING] >> CPU->GPU copy is the pipeline BOTTLENECK "
-                f"(dominates in {copy_bottleneck_count}/{self.num_layers} layers)"
-            )
-        elif default_stream_bottleneck_count > copy_bottleneck_count:
-            logger.info(
-                f"[GPU_CONNECTOR_TIMING] >> RoPE is the pipeline BOTTLENECK "
-                f"(dominates in {default_stream_bottleneck_count}/{self.num_layers} layers)"
-            )
-        else:
-            logger.info(
-                f"[GPU_CONNECTOR_TIMING] >> Pipeline is BALANCED (copy and RoPE take similar time)"
+                f"[GPU_CONNECTOR_TIMING] PIPELINE ANALYSIS: "
+                f"copy_bottleneck={copy_bottleneck_count} layers, "
+                f"rope_bottleneck={default_stream_bottleneck_count} layers"
             )
 
         # free the buffer memory
@@ -1125,7 +1122,7 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         The flow for each layer is:
         1. Read layer i from paged memory into buffer
-        2. Apply fused RoPE adjustment (if cache_positions is True)
+        2. Apply fused RoPE adjustment (if needs_rope_adjustment is True)
         3. Yield (allows blending via process_qkv which modifies buffer in place)
         4. On next iteration, write layer i back to paged memory before reading i+1
 
@@ -1136,8 +1133,8 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
         :param ends: The ending indices of the KV cache chunks.
         :param kvcaches: The paged GPU memory KV caches.
         :param slot_mapping: The slot mapping for the tokens.
-        :param old_positions: Optional tensor of original positions for RoPE adjustment.
-            If not provided, assumes positions are starts[0]:ends[-1].
+        :param chunk_boundaries: List of chunk start positions for RoPE adjustment.
+        :param needs_rope_adjustment: Whether RoPE adjustment is needed.
         """
         self.initialize_kvcaches_ptr(**kwargs)
         assert self.kvcaches is not None, (
@@ -1149,87 +1146,242 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
+        # Get RoPE adjustment parameters from kwargs
+        chunk_boundaries = kwargs.get("chunk_boundaries", None)
+        needs_rope_adjustment = kwargs.get("needs_rope_adjustment", False)
+
         self._lazy_initialize_buffer(self.kvcaches)
 
         num_all_tokens = ends[-1] - starts[0]
         slot_mapping_full = slot_mapping[starts[0] : ends[-1]]
 
-        # Log key information about the GPU-direct transfer
-        logger.info(f"[GPU_DIRECT] batched_from_gpu_to_buffer starting:")
-        logger.info(f"[GPU_DIRECT]   starts={starts}, ends={ends}")
-        logger.info(f"[GPU_DIRECT]   num_all_tokens={num_all_tokens}")
-        logger.info(f"[GPU_DIRECT]   slot_mapping_full shape={slot_mapping_full.shape}")
-        logger.info(f"[GPU_DIRECT]   slot_mapping_full range: [{slot_mapping_full.min().item()}..{slot_mapping_full.max().item()}]")
-        
-        # Verify slot_mapping is not all zeros/invalid
-        valid_slots = (slot_mapping_full >= 0).sum().item()
-        logger.info(f"[GPU_DIRECT]   valid slots (>=0): {valid_slots}/{len(slot_mapping_full)}")
-        if valid_slots == 0:
-            logger.error("[GPU_DIRECT] ERROR: All slot mappings are invalid (<0)! KV cache transfer will fail!")
-        
-        # NOTE: No RoPE adjustment needed for Sage GPU-direct blending!
-        # The concurrent prefill already uses sage_position_offset to compute
-        # KV cache with correct positional encoding. See gpu_model_runner.py
-        # where positions are computed with sage_position_offset added.
-        logger.info(f"[GPU_DIRECT]   Skipping RoPE adjustment (sage_position_offset already applied during prefill)")
+        logger.debug(
+            "[GPU_DIRECT] batched_from_gpu_to_buffer: tokens=%d, "
+            "chunks=%d, needs_rope=%s",
+            num_all_tokens,
+            len(chunk_boundaries) if chunk_boundaries else 0,
+            needs_rope_adjustment,
+        )
 
+        # Recompute slot_mapping to account for chunk boundaries.
+        # Each chunk stored KV at positions 0..chunk_len-1 within its own blocks.
+        # Keep this on-device to avoid GPU->CPU sync and host round-trips.
+        pos_in_chunk = None
+        if chunk_boundaries is not None and len(chunk_boundaries) > 1:
+            kv_cache_config = kwargs.get("kv_cache_config")
+            if kv_cache_config is not None:
+                block_size = kv_cache_config.block_size
+            elif self.use_mla:
+                block_size = self.kvcaches[0].shape[1]
+            else:
+                block_size = self.kvcaches[0].shape[2]
+            device = slot_mapping_full.device
+
+            total_blocks = (num_all_tokens + block_size - 1) // block_size
+            if total_blocks > 0:
+                slot_mapping_i64 = slot_mapping_full.to(dtype=torch.int64)
+                block_start_positions = (
+                    torch.arange(total_blocks, device=device, dtype=torch.int64)
+                    * block_size
+                )
+                block_ids = torch.div(
+                    slot_mapping_i64[block_start_positions],
+                    block_size,
+                    rounding_mode="floor",
+                )
+
+                boundaries = torch.tensor(
+                    chunk_boundaries + [num_all_tokens],
+                    device=device,
+                    dtype=torch.int64,
+                )
+                chunk_lens = boundaries[1:] - boundaries[:-1]
+                blocks_per_chunk = torch.div(
+                    chunk_lens + block_size - 1,
+                    block_size,
+                    rounding_mode="floor",
+                )
+                cumulative_blocks = torch.zeros(
+                    boundaries.shape[0], device=device, dtype=torch.int64
+                )
+                cumulative_blocks[1:] = torch.cumsum(blocks_per_chunk, dim=0)
+
+                token_positions = torch.arange(
+                    num_all_tokens, device=device, dtype=torch.int64
+                )
+                chunk_id = torch.bucketize(
+                    token_positions, boundaries[1:], right=True
+                )
+                chunk_starts = boundaries[chunk_id]
+                pos_in_chunk = token_positions - chunk_starts
+
+                chunk_local_block = torch.div(
+                    pos_in_chunk, block_size, rounding_mode="floor"
+                )
+                parent_block_index = cumulative_blocks[chunk_id] + chunk_local_block
+                parent_block_index.clamp_(0, total_blocks - 1)
+                actual_block_id = block_ids[parent_block_index]
+                pos_in_block = torch.remainder(pos_in_chunk, block_size)
+                slot_mapping_full = actual_block_id * block_size + pos_in_block
+
+        # =============================================================
+        # IN-PLACE ROPE: Apply RoPE directly on paged memory
+        # =============================================================
+
+        # Compute old_positions and new_positions for RoPE adjustment
+        old_positions_full = None
+        new_positions_full = None
+        if needs_rope_adjustment and chunk_boundaries is not None:
+            device = self.kvcaches[0].device
+
+            # old_positions: position within each chunk (reuse pos_in_chunk if available)
+            if pos_in_chunk is not None:
+                old_positions_full = pos_in_chunk  # Already int64 on GPU
+            else:
+                boundaries = torch.tensor(
+                    chunk_boundaries + [num_all_tokens],
+                    device=device,
+                    dtype=torch.int64,
+                )
+                token_positions = torch.arange(
+                    num_all_tokens, device=device, dtype=torch.int64
+                )
+                chunk_id = torch.bucketize(
+                    token_positions, boundaries[1:], right=True
+                )
+                old_positions_full = token_positions - boundaries[chunk_id]
+
+            # new_positions: absolute positions
+            new_positions_full = torch.arange(
+                starts[0], ends[-1], device=device, dtype=torch.int64
+            )
+        elif needs_rope_adjustment:
+            logger.error("[GPU_DIRECT] needs_rope_adjustment=True but chunk_boundaries is None")
+            needs_rope_adjustment = False
+
+        # Initialize in-place RoPE if needed
+        if needs_rope_adjustment and self._paged_rope_inplace is None:
+            logger.warning("[GPU_DIRECT] PagedRopeInplace not pre-warmed, doing lazy init")
+            self._prewarm_paged_rope_inplace(self.kvcaches[0].device)
+            if self._paged_rope_inplace is None:
+                logger.error("[GPU_DIRECT] Failed to initialize PagedRopeInplace!")
+                needs_rope_adjustment = False
+
+        # Allocate single-layer buffer
         buffer_shape = self.get_shape(num_all_tokens)
-        logger.info(f"[GPU_DIRECT]   Allocating GPU buffer with shape={buffer_shape}")
         assert self.gpu_buffer_allocator is not None
         gpu_buffer_obj = self.gpu_buffer_allocator.allocate(
             buffer_shape, self.dtype, MemoryFormat.KV_2TD
         )
-        assert gpu_buffer_obj is not None, (
-            "Failed to allocate GPU buffer in GPUConnector"
-        )
+        assert gpu_buffer_obj is not None, "Failed to allocate GPU buffer"
         assert gpu_buffer_obj.tensor is not None
 
-        # First yield: preparation complete
+        rope_start = None
+        rope_end = None
+
+        # Apply RoPE in-place on ALL layers
+        if needs_rope_adjustment:
+            if self.enable_gpu_timing:
+                rope_start = torch.cuda.Event(enable_timing=True)
+                rope_start.record()
+            for layer_id in range(self.num_layers):
+                self._paged_rope_inplace(
+                    old_positions_full,
+                    new_positions_full,
+                    slot_mapping_full,
+                    self.kvcaches[layer_id],
+                    self.vllm_two_major,
+                )
+            if self.enable_gpu_timing:
+                rope_end = torch.cuda.Event(enable_timing=True)
+                rope_end.record()
+
+        # First yield: RoPE complete
         yield
 
-        for layer_id in range(self.num_layers + 1):
-            # Write the previous layer's blended data back to paged memory
-            if layer_id > 0:
-                prev_layer = layer_id - 1
-                lmc_ops.single_layer_kv_transfer(
-                    gpu_buffer_obj.tensor,
-                    self.kvcaches[prev_layer],
-                    slot_mapping_full,
-                    False,  # from_paged = False (write to paged memory)
-                    False,  # shape is [2, num_tokens, hidden_dim]
-                    self.vllm_two_major,
-                    self.use_mla,
+        # Layer-by-layer read -> blend -> write
+        # Read from RECOMPUTED slots (where chunk data is),
+        # write to ORIGINAL slots (where model expects)
+        original_slot_mapping = kwargs["slot_mapping"][starts[0]:ends[-1]]
+        per_layer_read_events = []
+        per_layer_write_events = []
+
+        for layer_id in range(self.num_layers):
+            # Read from paged memory into buffer (from RECOMPUTED slots)
+            if self.enable_gpu_timing:
+                read_start_evt = torch.cuda.Event(enable_timing=True)
+                read_start_evt.record()
+            lmc_ops.single_layer_kv_transfer(
+                gpu_buffer_obj.tensor,
+                self.kvcaches[layer_id],
+                slot_mapping_full,
+                True,   # from_paged = True
+                False,
+                self.vllm_two_major,
+                self.use_mla,
+            )
+            if self.enable_gpu_timing:
+                read_end_evt = torch.cuda.Event(enable_timing=True)
+                read_end_evt.record()
+                per_layer_read_events.append((read_start_evt, read_end_evt))
+            self.buffer_mapping[layer_id] = gpu_buffer_obj
+
+            yield  # Blender modifies gpu_buffer_obj.tensor
+
+            # Write blended result back (to ORIGINAL slots)
+            if self.enable_gpu_timing:
+                write_start_evt = torch.cuda.Event(enable_timing=True)
+                write_start_evt.record()
+            lmc_ops.single_layer_kv_transfer(
+                gpu_buffer_obj.tensor,
+                self.kvcaches[layer_id],
+                original_slot_mapping,
+                False,  # from_paged = False (write to paged memory)
+                False,
+                self.vllm_two_major,
+                self.use_mla,
+            )
+            if self.enable_gpu_timing:
+                write_end_evt = torch.cuda.Event(enable_timing=True)
+                write_end_evt.record()
+                per_layer_write_events.append((write_start_evt, write_end_evt))
+
+            del self.buffer_mapping[layer_id]
+
+        yield  # "write last layer" yield
+
+        if self.enable_gpu_timing:
+            torch.cuda.synchronize()
+            rope_time = 0.0
+            if needs_rope_adjustment and rope_start is not None and rope_end is not None:
+                rope_time = rope_start.elapsed_time(rope_end)
+
+            total_read_time = 0.0
+            total_write_time = 0.0
+            for layer_id, ((rs, re), (ws, we)) in enumerate(
+                zip(per_layer_read_events, per_layer_write_events, strict=False)
+            ):
+                read_time = rs.elapsed_time(re)
+                write_time = ws.elapsed_time(we)
+                total_read_time += read_time
+                total_write_time += write_time
+                logger.info(
+                    "[GPU_DIRECT_PER_LAYER_TIMING] Layer %d: "
+                    "read_from_paged=%.3fms, write_to_paged=%.3fms",
+                    layer_id, read_time, write_time,
                 )
-                
-                del self.buffer_mapping[prev_layer]
 
-            # Read the current layer from paged memory
-            if layer_id < self.num_layers:
-                # Read from paged GPU memory into buffer
-                lmc_ops.single_layer_kv_transfer(
-                    gpu_buffer_obj.tensor,
-                    self.kvcaches[layer_id],
-                    slot_mapping_full,
-                    True,  # from_paged = True (read from paged memory)
-                    False,  # shape is [2, num_tokens, hidden_dim]
-                    self.vllm_two_major,
-                    self.use_mla,
-                )
+            logger.info(
+                "[GPU_DIRECT_INPLACE_TIMING] SUMMARY: "
+                "rope_inplace=%.3fms, total_read=%.3fms, total_write=%.3fms, "
+                "num_tokens=%d, num_layers=%d",
+                rope_time, total_read_time, total_write_time,
+                num_all_tokens, self.num_layers,
+            )
 
-                # No RoPE adjustment or gap zeroing needed - concurrent prefill
-                # already computed KV cache with correct positions
-
-                # Store in buffer_mapping for get_kv() to access
-                self.buffer_mapping[layer_id] = gpu_buffer_obj
-
-            yield
-
-        # Clean up
-        assert len(self.buffer_mapping) == 0, (
-            "Buffer mapping should be empty after all layers are processed"
-        )
         gpu_buffer_obj.ref_count_down()
 
+        # Final cleanup yield
         yield
 
 class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):

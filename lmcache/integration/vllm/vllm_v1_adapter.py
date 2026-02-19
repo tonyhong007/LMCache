@@ -236,10 +236,9 @@ class RequestTracker:
             self.num_saved_tokens = lmcache_cached_tokens
             num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
 
-            # FIX: For preempted requests, restore token_ids from the full
-            # token list to ensure chunk keys match what was used during
-            # lookup. The lookup uses request.all_token_ids, so we need the
-            # same tokens for retrieve.
+            # For preempted requests, restore token_ids from the full token list.
+            # We need enough tokens for retrieve - tokens[:lmcache_cached_tokens]
+            # will give us the prompt tokens which match the stored cache keys.
             num_tokens_needed = max(
                 num_computed_tokens + len(new_token_ids),
                 lmcache_cached_tokens,
@@ -519,6 +518,9 @@ class LMCacheConnectorV1Impl:
         else:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
+            self.enable_sage = os.environ.get(
+                "ENABLE_SAGE", "False"
+            ).lower() == "true"
 
             if self.enable_blending:
                 assert self.lmcache_engine is not None
@@ -782,10 +784,10 @@ class LMCacheConnectorV1Impl:
             if request.load_spec is None:
                 continue
 
-            tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
+            tokens = request.token_ids
             slot_mapping = request.slot_mapping.to(self.device)
-            assert len(tokens) == len(slot_mapping)
+            assert len(tokens) == len(slot_mapping), f"tokens={len(tokens)}, slot_mapping={len(slot_mapping)}"
 
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
             masked_token_count = (
@@ -804,57 +806,77 @@ class LMCacheConnectorV1Impl:
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
-                    start_time = time.time()
-                    logger.info(
-                        "Start blending %d tokens for request %s at time %.3f",
-                        lmcache_cached_tokens,
-                        request.req_id,
-                        start_time,
-                    )
+                    sage_enable_timing = os.getenv("SAGE_ENABLE_TIMING", "0").lower() == "1"
+                    if sage_enable_timing:
+                        start_time = time.time()
+                        logger.info(
+                            "Start blending %d tokens for request %s at time %.3f",
+                            lmcache_cached_tokens,
+                            request.req_id,
+                            start_time,
+                        )
 
-                    # SAGE ZERO-COPY: For requests with transferred blocks, always use
-                    # GPU-direct blending since KV is already in GPU paged memory
-                    # Also check env var for manual override
+                    # SAGE ZERO-COPY: For requests with transferred blocks, use
+                    # GPU-direct blending since KV is already in GPU paged memory.
+                    # Requires ENABLE_GPU_BLEND env var to be set.
                     use_gpu_blend = (
                         request.sage_blocks_transferred and 
-                        os.environ.get("LMCACHE_SAGE_GPU_BLEND", "").lower() in ("1", "true", "yes")
+                        os.environ.get("ENABLE_GPU_BLEND", "False").lower() == "true"
                     )
 
                     if use_gpu_blend:
-                        logger.info(
+                        logger.debug(
                             "[SAGE_BLEND] Using GPU-direct blending for request %s "
                             "(sage_blocks_transferred=%s)",
                             request.req_id,
                             request.sage_blocks_transferred,
                         )
 
-                        # Extract chunk boundaries from tokens using separator pattern
-                        # Default separator is "[SEP]" which typically tokenizes to a specific ID
-                        chunk_boundaries = None
+                        # Check if RoPE adjustment is needed for this request
+                        # When sage_needs_rope_adjustment=True: chunks were prefilled 
+                        # without position offsets, so RoPE adjustment is needed during blending
+                        # When sage_needs_rope_adjustment=False: chunks were prefilled with
+                        # correct position offsets (optimization mode), no adjustment needed
+                        needs_rope_adjustment = getattr(
+                            request, "sage_needs_rope_adjustment", False
+                        )
+                        
+                        logger.debug(
+                            "[SAGE_BLEND] Request %s: needs_rope_adjustment=%s",
+                            request.req_id,
+                            needs_rope_adjustment,
+                        )
+
                         # Get chunk boundaries from request if available
+                        # Only required when needs_rope_adjustment=True
                         chunk_boundaries = getattr(
                             request, "sage_chunk_boundaries", None
                         )
 
-                        assert chunk_boundaries is not None, (
-                            "Sage GPU-direct blending requires chunk boundaries "
-                            "to be provided in request.sage_chunk_boundaries"
-                        )
+                        if needs_rope_adjustment:
+                            assert chunk_boundaries is not None, (
+                                "RoPE adjustment requires chunk boundaries "
+                                "to be provided in request.sage_chunk_boundaries"
+                            )
 
-                        # No RoPE adjustment needed - Sage concurrent prefill already
-                        # computed KV cache with correct position_offset
-                        # For zero-copy requests, pass sage_zero_copy=True to retrieve ALL tokens
-                        # from GPU memory (not just what's in the token database)
+                        # For SAGE zero-copy requests, ALL tokens have KV in GPU memory
+                        # and need to be blended. Create a mask with all True values.
+                        # This is different from CPU cache retrieval where only non-matching
+                        # tokens need recomputation.
+                        sage_token_mask = torch.ones(
+                            lmcache_cached_tokens, dtype=torch.bool
+                        )
                         self.blender.blend_from_gpu(
                             tokens[:lmcache_cached_tokens],
-                            token_mask[:lmcache_cached_tokens],
+                            sage_token_mask,
                             chunk_boundaries=chunk_boundaries,
+                            needs_rope_adjustment=needs_rope_adjustment,
                             kvcaches=kvcaches,
                             slot_mapping=slot_mapping[:lmcache_cached_tokens],
                             sage_zero_copy=request.sage_blocks_transferred,
                         )
                     else:
-                        logger.info(
+                        logger.debug(
                             "Using CPU-based blending for request %s",
                             request.req_id,
                         )
@@ -864,16 +886,15 @@ class LMCacheConnectorV1Impl:
                             kvcaches=kvcaches,
                             slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         )
-
-                    # Sync to get accurate timing - GPU ops are async
-                    end_time = time.time()
-                    logger.info(
-                        "Finished blending for request %s, at time %.3f, "
-                        "duration %.3f seconds",
-                        request.req_id,
-                        end_time,
-                        end_time - start_time,
-                    )
+                    if sage_enable_timing:
+                        end_time = time.time()
+                        logger.info(
+                            "Finished blending for request %s, at time %.3f, "
+                            "duration %.3f seconds",
+                            request.req_id,
+                            end_time,
+                            end_time - start_time,
+                        )
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         tokens[:lmcache_cached_tokens],
@@ -1051,6 +1072,10 @@ class LMCacheConnectorV1Impl:
         if not self.use_layerwise:
             return
 
+        # Skip CPU store when Sage is active — KV lives in GPU paged memory
+        if self.enable_sage:
+            return
+
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
@@ -1140,6 +1165,10 @@ class LMCacheConnectorV1Impl:
 
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
+            return
+
+        # Skip CPU store when Sage is active — KV lives in GPU paged memory
+        if self.enable_sage:
             return
 
         if self.use_layerwise:
@@ -1278,6 +1307,10 @@ class LMCacheConnectorV1Impl:
         # Ignore DP attention mock requests
         if request.request_id.startswith("mock_req"):
             return 0
+        # Sage: skip LMCache hit check entirely — KV is managed via
+        # GPU-direct zero-copy, not CPU-based LMCache retrieval
+        if os.environ.get("ENABLE_SAGE", "False").lower() == "true":
+            return 0
         # to handle preempted requests, we want `get_num_new_matched_tokens` to be
         # idempotent under the condition that `update_state_after_alloc` is NOT called
         # then the two side-effects that must be idempotent are:
@@ -1348,12 +1381,22 @@ class LMCacheConnectorV1Impl:
         if num_external_hit_tokens == request.num_tokens:
             need_to_allocate -= 1
 
-        logger.info(
-            "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, need to load: %d",
+        # DEBUG: Track request state and token counts
+        req_status = getattr(request, 'status', 'UNKNOWN')
+        num_computed = getattr(request, 'num_computed_tokens', 0)
+        all_token_len = len(request.all_token_ids) if hasattr(request, 'all_token_ids') else -1
+        prompt_token_len = len(request.prompt_token_ids) if hasattr(request, 'prompt_token_ids') else -1
+        logger.debug(
+            "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, need to load: %d, "
+            "status=%s, num_computed=%d, all_token_ids_len=%d, prompt_token_ids_len=%d",
             req_id,
             request.num_tokens,
             num_external_hit_tokens,
             need_to_allocate,
+            req_status,
+            num_computed,
+            all_token_len,
+            prompt_token_len,
         )
 
         self.load_specs[req_id] = LoadSpec(
@@ -1383,6 +1426,13 @@ class LMCacheConnectorV1Impl:
         # Clear local status in lookup client when a new request is
         # successfully scheduled.
         assert self.lookup_client is not None
+        req_status = getattr(request, 'status', 'UNKNOWN')
+        logger.debug(
+            "[DEBUG] update_state_after_alloc called for %s, status=%s, num_external_tokens=%d, clearing lookup cache",
+            request.request_id,
+            req_status,
+            num_external_tokens,
+        )
         self.lookup_client.clear_lookup_status(request.request_id)
 
         kv_transfer_params = (
@@ -1475,6 +1525,16 @@ class LMCacheConnectorV1Impl:
             # Ignore DP attention mock requests
             if request.req_id.startswith("mock_req"):
                 continue
+            # Sage: skip chunk requests entirely — they use GPU-direct
+            # zero-copy block transfer and don't need LMCache storage,
+            # lookup, or metadata bookkeeping.
+            if "_chunk_" in request.req_id:
+                logger.debug(
+                    "[SAGE] Skipping build_connector_meta for "
+                    "chunk request %s",
+                    request.req_id,
+                )
+                continue
             load_spec = self.load_specs.pop(request.req_id, None)
             num_tokens_to_compute = (
                 request.num_computed_tokens
@@ -1501,6 +1561,12 @@ class LMCacheConnectorV1Impl:
 
             # Check if this is a Sage zero-copy request
             sage_blocks_transferred = getattr(request, 'sage_blocks_transferred', False)
+            logger.debug(
+                "[SAGE_DEBUG] Request %s: sage_blocks_transferred=%s, prompt_len=%d",
+                request.req_id,
+                sage_blocks_transferred,
+                len(request.prompt_token_ids) if request.prompt_token_ids else 0,
+            )
 
             # For zero-copy requests, we need to create a load_spec to trigger blending
             # even though the KV is already in GPU memory (not CPU cache)
@@ -1529,13 +1595,18 @@ class LMCacheConnectorV1Impl:
             if req_meta is not None:
                 if sage_blocks_transferred:
                     req_meta.sage_blocks_transferred = True
-                    # Also copy chunk boundaries for GPU-direct blending
+                    # Also copy chunk boundaries and compacted tokens for GPU-direct blending
                     req_meta.sage_chunk_boundaries = getattr(
                         request, "sage_chunk_boundaries", None
                     )
+                    # Copy RoPE adjustment flag from request
+                    req_meta.sage_needs_rope_adjustment = getattr(
+                        request, "sage_needs_rope_adjustment", False
+                    )
                     logger.info(
                         f"[SAGE_ZERO_COPY] Request {request.req_id} marked for GPU-direct blending, "
-                        f"chunk_boundaries={req_meta.sage_chunk_boundaries}"
+                        f"chunk_boundaries={req_meta.sage_chunk_boundaries}, "
+                        f"needs_rope_adjustment={req_meta.sage_needs_rope_adjustment}"
                     )
                 meta.add_request(req_meta)
 
@@ -1546,6 +1617,9 @@ class LMCacheConnectorV1Impl:
         # changed from list to object `CachedRequestData`
         if isinstance(cached_reqs, list):
             for i, req in enumerate(cached_reqs):
+                # Sage: skip chunk requests (never tracked)
+                if "_chunk_" in req.req_id:
+                    continue
                 load_spec = self.load_specs.pop(req.req_id, None)
                 lmcache_cached_tokens = 0
                 vllm_cached_tokens = 0
@@ -1587,6 +1661,9 @@ class LMCacheConnectorV1Impl:
             return meta
 
         for i, req_id in enumerate(cached_reqs.req_ids):
+            # Sage: skip chunk requests (never tracked)
+            if "_chunk_" in req_id:
+                continue
             request_tracker = self._request_trackers[req_id]
             num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
             # TODO: this is a dangerous reference to the request object inside vllm

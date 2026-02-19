@@ -106,7 +106,176 @@ __global__ void rotary_embedding_kernel_fused(
       token_idx, key_stride);
 }
 
+// ============================================================================
+// IN-PLACE ROPE ON PAGED MEMORY
+// This kernel applies RoPE adjustment directly on paged KV cache without
+// requiring an intermediate contiguous buffer.
+// ============================================================================
+
+template <typename scalar_t, bool IS_NEOX>
+__global__ void rotary_embedding_paged_kernel_fused(
+    const int64_t* __restrict__ old_positions,  // [num_tokens]
+    const int64_t* __restrict__ new_positions,  // [num_tokens]
+    const int64_t* __restrict__ slot_mapping,   // [num_tokens]
+    scalar_t* __restrict__ key_cache,           // [num_blocks, block_size, num_heads, head_size]
+                                                // OR [2, num_blocks, block_size, num_heads, head_size]
+    const scalar_t* __restrict__ cos_sin_cache, // [max_position, rot_dim]
+    const int rot_dim,
+    const int num_heads,
+    const int head_size,
+    const int block_size,
+    const int block_stride_in_elems,  // Elements per block (block_size * num_heads * head_size)
+    const int key_offset               // Offset to K in vllm_two_major format (0 if K is first dim)
+) {
+  // Each thread block processes one token
+  const int token_idx = blockIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  
+  if (slot_idx < 0) {
+    return;
+  }
+  
+  const int64_t old_pos = old_positions[token_idx];
+  const int64_t new_pos = new_positions[token_idx];
+  
+  // Skip if positions are the same (no adjustment needed)
+  if (old_pos == new_pos) {
+    return;
+  }
+  
+  // Compute block and offset within block
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  
+  // Pointer to this token's K cache in paged memory
+  // Layout: key_cache[block_idx, block_offset, head_idx, head_offset]
+  scalar_t* token_k = key_cache + key_offset + 
+                      block_idx * block_stride_in_elems +
+                      block_offset * num_heads * head_size;
+  
+  // Get cos/sin for old and new positions
+  const int embed_dim = rot_dim / 2;
+  const scalar_t* old_cos_ptr = cos_sin_cache + old_pos * rot_dim;
+  const scalar_t* old_sin_ptr = old_cos_ptr + embed_dim;
+  const scalar_t* new_cos_ptr = cos_sin_cache + new_pos * rot_dim;
+  const scalar_t* new_sin_ptr = new_cos_ptr + embed_dim;
+  
+  // Process all heads and embed dimensions
+  const int nk = num_heads * embed_dim;
+  for (int i = threadIdx.x; i < nk; i += blockDim.x) {
+    const int head_idx = i / embed_dim;
+    const int rot_offset = i % embed_dim;
+    
+    int x_index, y_index;
+    scalar_t old_cos, old_sin, new_cos, new_sin;
+    
+    if (IS_NEOX) {
+      x_index = rot_offset;
+      y_index = embed_dim + rot_offset;
+      old_cos = LMCACHE_LDG(old_cos_ptr + x_index);
+      old_sin = LMCACHE_LDG(old_sin_ptr + x_index);
+      new_cos = LMCACHE_LDG(new_cos_ptr + x_index);
+      new_sin = LMCACHE_LDG(new_sin_ptr + x_index);
+    } else {
+      x_index = 2 * rot_offset;
+      y_index = 2 * rot_offset + 1;
+      old_cos = LMCACHE_LDG(old_cos_ptr + x_index / 2);
+      old_sin = LMCACHE_LDG(old_sin_ptr + x_index / 2);
+      new_cos = LMCACHE_LDG(new_cos_ptr + x_index / 2);
+      new_sin = LMCACHE_LDG(new_sin_ptr + x_index / 2);
+    }
+    
+    // Read from paged memory
+    scalar_t* head_ptr = token_k + head_idx * head_size;
+    const scalar_t x = head_ptr[x_index];
+    const scalar_t y = head_ptr[y_index];
+    
+    // Reverse old position encoding
+    const scalar_t x_reverse = x * old_cos + y * old_sin;
+    const scalar_t y_reverse = y * old_cos - x * old_sin;
+    
+    // Apply new position encoding
+    head_ptr[x_index] = x_reverse * new_cos - y_reverse * new_sin;
+    head_ptr[y_index] = y_reverse * new_cos + x_reverse * new_sin;
+  }
+}
+
 }  // namespace lmc
+
+// In-place RoPE on paged memory (no intermediate buffer needed!)
+void rotary_embedding_paged_inplace(
+    const torch::Tensor& old_positions,    // [num_tokens]
+    const torch::Tensor& new_positions,    // [num_tokens]
+    const torch::Tensor& slot_mapping,     // [num_tokens]
+    torch::Tensor& key_cache,              // [2, num_blocks, block_size, num_heads, head_size]
+                                           // OR [num_blocks, block_size, num_heads, head_size]
+    const torch::Tensor& cos_sin_cache,    // [max_position, rot_dim]
+    int64_t head_size,
+    bool is_neox,
+    bool vllm_two_major                    // true if key_cache is [2, num_blocks, ...]
+) {
+  int64_t num_tokens = slot_mapping.size(0);
+  if (num_tokens == 0) return;
+  
+  int rot_dim = cos_sin_cache.size(1);
+  int num_heads, block_size;
+  int64_t block_stride_in_elems;
+  int64_t key_offset = 0;
+  
+  if (vllm_two_major) {
+    // Format: [2, num_blocks, block_size, num_heads, head_size]
+    num_heads = key_cache.size(3);
+    block_size = key_cache.size(2);
+    block_stride_in_elems = key_cache.stride(1);
+    key_offset = 0;  // K is at index 0 of dim 0
+  } else {
+    // Format: [num_blocks, block_size, num_heads, head_size]
+    // or [num_blocks, 2, block_size, num_heads, head_size]
+    if (key_cache.dim() == 5) {
+      // [num_blocks, 2, block_size, num_heads, head_size]
+      num_heads = key_cache.size(3);
+      block_size = key_cache.size(2);
+      block_stride_in_elems = key_cache.stride(0);
+      key_offset = 0;  // K is at index 0 of dim 1
+    } else {
+      // [num_blocks, block_size, num_heads, head_size]
+      num_heads = key_cache.size(2);
+      block_size = key_cache.size(1);
+      block_stride_in_elems = key_cache.stride(0);
+      key_offset = 0;
+    }
+  }
+  
+  dim3 grid(num_tokens);
+  dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key_cache));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  
+  LMC_DISPATCH_FLOATING_TYPES(
+      key_cache.scalar_type(), "rotary_embedding_paged_inplace", [&] {
+        if (is_neox) {
+          lmc::rotary_embedding_paged_kernel_fused<scalar_t, true>
+              <<<grid, block, 0, stream>>>(
+                  old_positions.data_ptr<int64_t>(),
+                  new_positions.data_ptr<int64_t>(),
+                  slot_mapping.data_ptr<int64_t>(),
+                  key_cache.data_ptr<scalar_t>(),
+                  cos_sin_cache.data_ptr<scalar_t>(),
+                  rot_dim, num_heads, head_size, block_size,
+                  block_stride_in_elems, key_offset);
+        } else {
+          lmc::rotary_embedding_paged_kernel_fused<scalar_t, false>
+              <<<grid, block, 0, stream>>>(
+                  old_positions.data_ptr<int64_t>(),
+                  new_positions.data_ptr<int64_t>(),
+                  slot_mapping.data_ptr<int64_t>(),
+                  key_cache.data_ptr<scalar_t>(),
+                  cos_sin_cache.data_ptr<scalar_t>(),
+                  rot_dim, num_heads, head_size, block_size,
+                  block_stride_in_elems, key_offset);
+        }
+      });
+}
 
 void rotary_embedding_k_fused(
     const torch::Tensor&

@@ -83,6 +83,76 @@ class FusedRope:
         return self.fused_encode(old_positions, new_positions, k)
 
 
+class PagedRopeInplace:
+    """
+    Apply RoPE adjustment directly on paged KV cache memory.
+    This eliminates the need for an intermediate contiguous buffer,
+    which saves ~1GB memory allocation and copy overhead.
+    
+    The kernel reads K values from paged memory using slot_mapping,
+    applies inverse RoPE (undo old position), applies forward RoPE (new position),
+    and writes back to the same paged memory location.
+    """
+
+    def __init__(self, rope, is_neox_style):
+        self.rope = rope
+        self.is_neox_style = is_neox_style
+        self.head_size = rope.head_size
+        self.cos_sin_cache = rope.cos_sin_cache
+        self._cos_sin_cache_device = None
+
+    def apply_inplace(
+        self,
+        old_positions: torch.Tensor,    # [num_tokens]
+        new_positions: torch.Tensor,    # [num_tokens]
+        slot_mapping: torch.Tensor,     # [num_tokens]
+        key_cache: torch.Tensor,        # Paged KV cache
+        vllm_two_major: bool = True,    # True if [2, num_blocks, ...], False if [num_blocks, 2, ...]
+    ):
+        """
+        Apply RoPE adjustment in-place on paged memory.
+        
+        Args:
+            old_positions: Original positions (e.g., chunk-local positions starting from 0)
+            new_positions: Target positions (e.g., absolute positions in the full sequence)
+            slot_mapping: Maps token index to slot in paged memory
+            key_cache: The paged KV cache tensor
+            vllm_two_major: Memory layout flag
+        """
+        if old_positions.numel() == 0:
+            return
+            
+        # Ensure cos_sin_cache is on the right device (cache for efficiency)
+        if self._cos_sin_cache_device is None or self._cos_sin_cache_device.device != key_cache.device:
+            import time
+            t0 = time.perf_counter()
+            self._cos_sin_cache_device = self.cos_sin_cache.to(key_cache.device)
+            t1 = time.perf_counter()
+            logger.info(f"[PagedRopeInplace] cos_sin_cache.to(device) took {(t1-t0)*1000:.2f}ms, "
+                        f"shape={self.cos_sin_cache.shape}, size={self.cos_sin_cache.numel() * self.cos_sin_cache.element_size() / 1024 / 1024:.2f}MB")
+        
+        lmc_ops.rotary_embedding_paged_inplace(
+            old_positions,
+            new_positions,
+            slot_mapping,
+            key_cache,
+            self._cos_sin_cache_device,
+            self.head_size,
+            self.is_neox_style,
+            vllm_two_major,
+        )
+
+    def __call__(
+        self,
+        old_positions: torch.Tensor,
+        new_positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        key_cache: torch.Tensor,
+        vllm_two_major: bool = True,
+    ):
+        return self.apply_inplace(old_positions, new_positions, slot_mapping, key_cache, vllm_two_major)
+
+
 def validate_rope_params(
     head_size: int,
     rotary_dim: int,
@@ -110,12 +180,14 @@ def validate_rope_params(
     return True
 
 
-def validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size) -> bool:
+def validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size, dtype=None) -> bool:
     hidden_dim = head_size * 8
     num_tokens = 10
+    if dtype is None:
+        dtype = torch.bfloat16
 
-    dumb_q = torch.rand((num_tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
-    dumb_k = torch.rand((num_tokens, hidden_dim), device="cuda", dtype=torch.bfloat16)
+    dumb_q = torch.rand((num_tokens, hidden_dim), device="cuda", dtype=dtype)
+    dumb_k = torch.rand((num_tokens, hidden_dim), device="cuda", dtype=dtype)
     positions = torch.arange(num_tokens, device="cuda")
 
     q1 = dumb_q.clone()
@@ -189,11 +261,63 @@ def get_fused_rope(
     reverse_rope = BasicReverseRope(rope, rotary_dim, is_neox_style)
     fused_rope = FusedRope(rope, is_neox_style)
 
-    correct = validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size)
+    correct = validate_reverse_correctness(rope, reverse_rope, fused_rope, head_size, dtype=dtype)
     if not correct:
         logger.error(
             "Fused/reverse rotary encoding is not correct! Will disable blending!"
         )
         return None
+
+    return fused_rope
+
+
+def get_fused_rope_from_rotary_emb(
+    rotary_emb,
+) -> Optional[Callable[..., Any]]:
+    """Create a FusedRope directly from the vLLM model's rotary embedding.
+
+    This avoids recreating the RoPE from scratch (which would require
+    knowing all rope parameters including scaling). Instead, we reuse
+    the model's existing rotary_emb which already has the correct
+    cos_sin_cache with any rope_scaling applied.
+
+    This supports all RoPE variants (default, llama3, yarn, etc.)
+    since the cos_sin_cache is pre-computed by vLLM with the correct
+    scaling factors.
+
+    :param rotary_emb: The vLLM model's RotaryEmbedding instance
+        (from model.layers[0].self_attn.rotary_emb).
+    :return: A FusedRope instance, or None if validation fails.
+    """
+    head_size = rotary_emb.head_size
+    rotary_dim = rotary_emb.rotary_dim
+    is_neox_style = rotary_emb.is_neox_style
+    dtype = rotary_emb.dtype
+
+    if rotary_dim != head_size:
+        logger.error(
+            "KV blending only supports rotary_dim == head_size. "
+            "Got rotary_dim=%d, head_size=%d", rotary_dim, head_size,
+        )
+        return None
+
+    reverse_rope = BasicReverseRope(rotary_emb, rotary_dim, is_neox_style)
+    fused_rope = FusedRope(rotary_emb, is_neox_style)
+
+    correct = validate_reverse_correctness(
+        rotary_emb, reverse_rope, fused_rope, head_size, dtype=dtype,
+    )
+    if not correct:
+        logger.error(
+            "Fused/reverse rotary encoding is not correct! "
+            "Will disable blending!"
+        )
+        return None
+
+    logger.info(
+        "Created FusedRope from vLLM rotary_emb: head_size=%d, "
+        "cos_sin_cache positions=%d, is_neox_style=%s",
+        head_size, rotary_emb.cos_sin_cache.shape[0], is_neox_style,
+    )
 
     return fused_rope
