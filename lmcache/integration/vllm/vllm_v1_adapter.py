@@ -789,7 +789,10 @@ class LMCacheConnectorV1Impl:
             slot_mapping = request.slot_mapping.to(self.device)
             assert len(tokens) == len(slot_mapping), f"tokens={len(tokens)}, slot_mapping={len(slot_mapping)}"
 
-            token_mask = torch.ones(len(tokens), dtype=torch.bool)
+            # Keep mask on GPU when blending is enabled to avoid CPU->GPU copies
+            # and satisfy strict device checks in blender.process_qkv.
+            mask_device = self.device if self.enable_blending else "cpu"
+            token_mask = torch.ones(len(tokens), dtype=torch.bool, device=mask_device)
             masked_token_count = (
                 request.load_spec.vllm_cached_tokens
                 // self._lmcache_chunk_size
@@ -859,13 +862,26 @@ class LMCacheConnectorV1Impl:
                                 "to be provided in request.sage_chunk_boundaries"
                             )
 
-                        # For SAGE zero-copy requests, ALL tokens have KV in GPU memory
-                        # and need to be blended. Create a mask with all True values.
-                        # This is different from CPU cache retrieval where only non-matching
-                        # tokens need recomputation.
+                        # For SAGE zero-copy requests, all prompt KV is already in GPU memory.
+                        # Build a recompute candidate mask for blending:
+                        # - default: all True
+                        # - optimization: exclude first chunk (it has no left context,
+                        #   so its standalone prefill KV is already correct for causal LMs).
                         sage_token_mask = torch.ones(
-                            lmcache_cached_tokens, dtype=torch.bool
+                            lmcache_cached_tokens, dtype=torch.bool, device=self.device
                         )
+                        if (
+                            chunk_boundaries is not None
+                            and len(chunk_boundaries) > 1
+                            and chunk_boundaries[0] == 0
+                        ):
+                            first_chunk_end = chunk_boundaries[1]
+                            if 0 < first_chunk_end <= lmcache_cached_tokens:
+                                sage_token_mask[:first_chunk_end] = False
+                                logger.info(
+                                    "[SAGE_BLEND] Excluding first chunk [0:%d) from recompute candidates",
+                                    first_chunk_end,
+                                )
                         self.blender.blend_from_gpu(
                             tokens[:lmcache_cached_tokens],
                             sage_token_mask,

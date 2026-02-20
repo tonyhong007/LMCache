@@ -91,6 +91,7 @@ class LMCBlender:
         total_t0 = 0.0
         rotary_ms = 0.0
         diff_k_ms = 0.0
+        attn_mask = self.metadata.attn_mask
         if timing_enabled:
             if q.is_cuda:
                 torch.cuda.synchronize()
@@ -136,11 +137,38 @@ class LMCBlender:
 
             assert self.common_metadata.recomp_ratios is not None
 
-            # TODO(Jiayi): remove `[0]` hardcode
-            topk_num = int(total_len * self.common_metadata.recomp_ratios[0])
-            topk_num = max(topk_num, 1)
+            candidate_indices = None
+            if attn_mask is not None:
+                assert attn_mask.device == diff_k.device, (
+                    "Blend candidate mask must be on the same device as diff_k: "
+                    f"mask={attn_mask.device}, diff_k={diff_k.device}"
+                )
+                assert attn_mask.dtype == torch.bool, (
+                    "Blend candidate mask must have bool dtype: "
+                    f"got {attn_mask.dtype}"
+                )
+                assert attn_mask.ndim == 1 and attn_mask.numel() == total_len, (
+                    "Blend candidate mask must be 1D with one value per token: "
+                    f"shape={tuple(attn_mask.shape)}, expected=({total_len},)"
+                )
+                candidate_indices = torch.nonzero(attn_mask, as_tuple=False).flatten()
+                assert candidate_indices.numel() > 0, (
+                    "Blend candidate mask cannot be empty"
+                )
 
-            top_indices = torch.topk(diff_k, k=topk_num).indices
+            # TODO(Jiayi): remove `[0]` hardcode
+            base_topk_num = int(total_len * self.common_metadata.recomp_ratios[0])
+            base_topk_num = max(base_topk_num, 1)
+            effective_len = (
+                int(candidate_indices.numel()) if candidate_indices is not None else total_len
+            )
+            topk_num = min(base_topk_num, effective_len)
+
+            if candidate_indices is not None:
+                top_local_indices = torch.topk(diff_k[candidate_indices], k=topk_num).indices
+                top_indices = candidate_indices[top_local_indices]
+            else:
+                top_indices = torch.topk(diff_k, k=topk_num).indices
             top_indices, _ = torch.sort(top_indices)
 
             k, v = k[top_indices], v[top_indices]
@@ -237,6 +265,7 @@ class LMCBlender:
         """
         if isinstance(tokens, list):
             tokens = torch.tensor(tokens).cuda()
+        self.metadata.attn_mask = mask
 
         blend_start_event = None
         blend_end_event = None
@@ -373,6 +402,7 @@ class LMCBlender:
         """
         if isinstance(tokens, list):
             tokens = torch.tensor(tokens).cuda()
+        self.metadata.attn_mask = mask
 
         blend_start_event = None
         blend_end_event = None
