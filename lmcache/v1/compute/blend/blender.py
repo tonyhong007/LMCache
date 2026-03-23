@@ -98,6 +98,19 @@ class LMCBlender:
             total_t0 = time.perf_counter()
 
         old_k, old_v = self.gpu_connector.get_kv(layer_id)
+        # Debug: log shapes and imp_indices state at entry
+        if layer_id <= 2 or layer_id == self.num_layers - 1:
+            _imp = self.metadata.imp_indices
+            logger.info(
+                "[SAGE_BLEND_DEBUG] process_qkv entry: layer=%d "
+                "q=%s k=%s old_k=%s imp_indices=%s",
+                layer_id,
+                tuple(q.shape),
+                tuple(k.shape),
+                tuple(old_k.shape),
+                (tuple(_imp.shape), int(_imp[0].item()), int(_imp[-1].item()))
+                if _imp is not None else None,
+            )
 
         if attn_output is None:
             attn_output = torch.empty(
