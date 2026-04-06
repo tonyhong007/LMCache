@@ -565,11 +565,6 @@ class LMCacheConnectorV1Impl:
             if self.enable_blending
             else None
         )
-        # Sync CacheBlend: run full N-token diff-k recomputation
-        # synchronously before TTFT.
-        self._sync_cacheblend: bool = (
-            os.getenv("SAGE_SYNC_CACHEBLEND", "").lower() in ("1", "true")
-        )
         # Fraction of tokens to recompute synchronously before TTFT
         # (tokenwise only). e.g. 0.2 means 20% of top-diff tokens pre-TTFT.
         self._tokenwise_pre_ttft_ratio: float = _normalize_ratio(
@@ -584,21 +579,19 @@ class LMCacheConnectorV1Impl:
         self._layerwise_defer_diff_k: bool = (
             os.getenv("SAGE_LAYERWISE_DEFER_DIFF_K", "").lower() in ("1", "true")
         )
-        # Derive SageMethod from strategy type.
+        # Derive SageMethod: use incremental strategy if configured,
+        # otherwise default to sync cacheblend.
         if not self.enable_sage:
             self._sage_method = SageMethod.NONE
-        elif self._sync_cacheblend:
-            self._sage_method = SageMethod.CACHEBLEND
         elif isinstance(self._incremental_blend_strategy, LayerWiseIncrementalBlendStrategy):
             self._sage_method = SageMethod.CACHEBLEND_LAYERWISE
         elif isinstance(self._incremental_blend_strategy, TokenWiseIncrementalBlendStrategy):
             self._sage_method = SageMethod.CACHEBLEND_TOKENWISE
         else:
-            raise ValueError(
-                "SAGE is enabled (ENABLE_SAGE=true) but no valid method could "
-                "be derived. Set SAGE_SYNC_CACHEBLEND=1 or configure an "
-                "incremental blend strategy (token_wise / layer_wise)."
-            )
+            self._sage_method = SageMethod.CACHEBLEND
+        self._sync_cacheblend = (
+            self._sage_method == SageMethod.CACHEBLEND
+        )
         logger.info(
             "[SAGE_CONFIG] sage_method=%s",
             self._sage_method.value,
@@ -1357,10 +1350,8 @@ class LMCacheConnectorV1Impl:
 
                     # SAGE ZERO-COPY: For requests with transferred blocks, use
                     # GPU-direct blending since KV is already in GPU paged memory.
-                    # Requires ENABLE_GPU_BLEND env var to be set.
                     use_gpu_blend = (
-                        request.sage_blocks_transferred and 
-                        os.environ.get("ENABLE_GPU_BLEND", "False").lower() == "true"
+                        request.sage_blocks_transferred and self.enable_sage
                     )
 
                     if use_gpu_blend:
