@@ -106,173 +106,138 @@ __global__ void rotary_embedding_kernel_fused(
       token_idx, key_stride);
 }
 
-// ============================================================================
-// IN-PLACE ROPE ON PAGED MEMORY
-// This kernel applies RoPE adjustment directly on paged KV cache without
-// requiring an intermediate contiguous buffer.
-// ============================================================================
-
+// Corrects chunk-local positions to absolute positions on paged K cache.
 template <typename scalar_t, bool IS_NEOX>
-__global__ void rotary_embedding_paged_kernel_fused(
-    const int64_t* __restrict__ old_positions,  // [num_tokens]
-    const int64_t* __restrict__ new_positions,  // [num_tokens]
-    const int64_t* __restrict__ slot_mapping,   // [num_tokens]
-    scalar_t* __restrict__ key_cache,           // [num_blocks, block_size, num_heads, head_size]
-                                                // OR [2, num_blocks, block_size, num_heads, head_size]
-    const scalar_t* __restrict__ cos_sin_cache, // [max_position, rot_dim]
+__global__ void rotary_embedding_paged_fused_multi_layer_kernel(
+    const int64_t* __restrict__ old_positions,     // [num_tokens]
+    const int64_t* __restrict__ new_positions,     // [num_tokens]
+    const int64_t* __restrict__ slot_mapping,      // [num_tokens]
+    const int64_t* __restrict__ key_cache_ptrs,    // [num_layers] as int64 device ptrs
+    const scalar_t* __restrict__ cos_sin_cache,    // [max_pos, rot_dim]
     const int rot_dim,
-    const int num_heads,
+    const int num_kv_heads,
     const int head_size,
     const int block_size,
-    const int block_stride_in_elems,  // Elements per block (block_size * num_heads * head_size)
-    const int key_offset               // Offset to K in vllm_two_major format (0 if K is first dim)
+    const int block_stride_in_elems,   // = block_size * num_kv_heads * head_size
+    const int64_t key_offset           // byte offset to K start (0 for vllm_two_major)
 ) {
-  // Each thread block processes one token
   const int token_idx = blockIdx.x;
-  const int64_t slot_idx = slot_mapping[token_idx];
-  
-  if (slot_idx < 0) {
-    return;
-  }
-  
+  const int layer_idx = blockIdx.y;
+
+  const int64_t slot    = slot_mapping[token_idx];
   const int64_t old_pos = old_positions[token_idx];
   const int64_t new_pos = new_positions[token_idx];
-  
-  // Skip if positions are the same (no adjustment needed)
-  if (old_pos == new_pos) {
-    return;
-  }
-  
-  // Compute block and offset within block
-  const int64_t block_idx = slot_idx / block_size;
-  const int64_t block_offset = slot_idx % block_size;
-  
-  // Pointer to this token's K cache in paged memory
-  // Layout: key_cache[block_idx, block_offset, head_idx, head_offset]
-  scalar_t* token_k = key_cache + key_offset + 
-                      block_idx * block_stride_in_elems +
-                      block_offset * num_heads * head_size;
-  
-  // Get cos/sin for old and new positions
+
+  // Nothing to do if position unchanged or invalid slot
+  if (old_pos == new_pos || slot < 0) return;
+
+  scalar_t* key_cache = reinterpret_cast<scalar_t*>(key_cache_ptrs[layer_idx]);
+
+  const int64_t bk = slot / block_size;
+  const int64_t bo = slot % block_size;
+  scalar_t* token_k = key_cache + key_offset
+                      + bk * (int64_t)block_stride_in_elems
+                      + bo * num_kv_heads * head_size;
+
   const int embed_dim = rot_dim / 2;
-  const scalar_t* old_cos_ptr = cos_sin_cache + old_pos * rot_dim;
-  const scalar_t* old_sin_ptr = old_cos_ptr + embed_dim;
-  const scalar_t* new_cos_ptr = cos_sin_cache + new_pos * rot_dim;
-  const scalar_t* new_sin_ptr = new_cos_ptr + embed_dim;
-  
-  // Process all heads and embed dimensions
-  const int nk = num_heads * embed_dim;
+  const scalar_t* old_cos = cos_sin_cache + old_pos * rot_dim;
+  const scalar_t* old_sin = old_cos + embed_dim;
+  const scalar_t* new_cos = cos_sin_cache + new_pos * rot_dim;
+  const scalar_t* new_sin = new_cos + embed_dim;
+
+  const int nk = num_kv_heads * embed_dim;
   for (int i = threadIdx.x; i < nk; i += blockDim.x) {
-    const int head_idx = i / embed_dim;
-    const int rot_offset = i % embed_dim;
-    
-    int x_index, y_index;
-    scalar_t old_cos, old_sin, new_cos, new_sin;
-    
+    const int h = i / embed_dim;
+    const int r = i % embed_dim;
+    int xi, yi;
+    scalar_t oc, os, nc, ns;
+
     if (IS_NEOX) {
-      x_index = rot_offset;
-      y_index = embed_dim + rot_offset;
-      old_cos = LMCACHE_LDG(old_cos_ptr + x_index);
-      old_sin = LMCACHE_LDG(old_sin_ptr + x_index);
-      new_cos = LMCACHE_LDG(new_cos_ptr + x_index);
-      new_sin = LMCACHE_LDG(new_sin_ptr + x_index);
+      xi = r;         yi = embed_dim + r;
+      oc = LMCACHE_LDG(old_cos + xi); os = LMCACHE_LDG(old_sin + xi);
+      nc = LMCACHE_LDG(new_cos + xi); ns = LMCACHE_LDG(new_sin + xi);
     } else {
-      x_index = 2 * rot_offset;
-      y_index = 2 * rot_offset + 1;
-      old_cos = LMCACHE_LDG(old_cos_ptr + x_index / 2);
-      old_sin = LMCACHE_LDG(old_sin_ptr + x_index / 2);
-      new_cos = LMCACHE_LDG(new_cos_ptr + x_index / 2);
-      new_sin = LMCACHE_LDG(new_sin_ptr + x_index / 2);
+      xi = 2 * r;     yi = 2 * r + 1;
+      oc = LMCACHE_LDG(old_cos + r);  os = LMCACHE_LDG(old_sin + r);
+      nc = LMCACHE_LDG(new_cos + r);  ns = LMCACHE_LDG(new_sin + r);
     }
-    
-    // Read from paged memory
-    scalar_t* head_ptr = token_k + head_idx * head_size;
-    const scalar_t x = head_ptr[x_index];
-    const scalar_t y = head_ptr[y_index];
-    
-    // Reverse old position encoding
-    const scalar_t x_reverse = x * old_cos + y * old_sin;
-    const scalar_t y_reverse = y * old_cos - x * old_sin;
-    
-    // Apply new position encoding
-    head_ptr[x_index] = x_reverse * new_cos - y_reverse * new_sin;
-    head_ptr[y_index] = y_reverse * new_cos + x_reverse * new_sin;
+
+    scalar_t* hp = token_k + h * head_size;
+    const scalar_t x = hp[xi], y = hp[yi];
+    const scalar_t xr = x * oc + y * os;
+    const scalar_t yr = y * oc - x * os;
+    hp[xi] = xr * nc - yr * ns;
+    hp[yi] = yr * nc + xr * ns;
   }
 }
 
 }  // namespace lmc
 
 // In-place RoPE on paged memory (no intermediate buffer needed!)
-void rotary_embedding_paged_inplace(
-    const torch::Tensor& old_positions,    // [num_tokens]
-    const torch::Tensor& new_positions,    // [num_tokens]
-    const torch::Tensor& slot_mapping,     // [num_tokens]
-    torch::Tensor& key_cache,              // [2, num_blocks, block_size, num_heads, head_size]
-                                           // OR [num_blocks, block_size, num_heads, head_size]
-    const torch::Tensor& cos_sin_cache,    // [max_position, rot_dim]
+// In-place RoPE correction across all layers in a single kernel launch.
+// Corrects chunk-local positions to absolute positions on paged K cache.
+void rotary_embedding_paged_fused_multi_layer(
+    const torch::Tensor& old_positions,     // [num_tokens]
+    const torch::Tensor& new_positions,     // [num_tokens]
+    const torch::Tensor& slot_mapping,      // [num_tokens]
+    const torch::Tensor& key_cache_ptrs,    // [num_layers] int64 device ptrs
+    const torch::Tensor& key_cache_ref,     // shape/dtype reference (e.g. kvcaches[0])
+    const torch::Tensor& cos_sin_cache,     // [max_pos, rot_dim]
     int64_t head_size,
     bool is_neox,
-    bool vllm_two_major                    // true if key_cache is [2, num_blocks, ...]
+    bool vllm_two_major
 ) {
   int64_t num_tokens = slot_mapping.size(0);
-  if (num_tokens == 0) return;
-  
+  int64_t num_layers = key_cache_ptrs.size(0);
+  if (num_tokens == 0 || num_layers == 0) return;
+
   int rot_dim = cos_sin_cache.size(1);
-  int num_heads, block_size;
+  int num_kv_heads, block_size;
   int64_t block_stride_in_elems;
   int64_t key_offset = 0;
-  
+
   if (vllm_two_major) {
-    // Format: [2, num_blocks, block_size, num_heads, head_size]
-    num_heads = key_cache.size(3);
-    block_size = key_cache.size(2);
-    block_stride_in_elems = key_cache.stride(1);
-    key_offset = 0;  // K is at index 0 of dim 0
+    num_kv_heads          = key_cache_ref.size(3);
+    block_size            = key_cache_ref.size(2);
+    block_stride_in_elems = key_cache_ref.stride(1);
+  } else if (key_cache_ref.dim() == 5) {
+    num_kv_heads          = key_cache_ref.size(3);
+    block_size            = key_cache_ref.size(2);
+    block_stride_in_elems = key_cache_ref.stride(0);
   } else {
-    // Format: [num_blocks, block_size, num_heads, head_size]
-    // or [num_blocks, 2, block_size, num_heads, head_size]
-    if (key_cache.dim() == 5) {
-      // [num_blocks, 2, block_size, num_heads, head_size]
-      num_heads = key_cache.size(3);
-      block_size = key_cache.size(2);
-      block_stride_in_elems = key_cache.stride(0);
-      key_offset = 0;  // K is at index 0 of dim 1
-    } else {
-      // [num_blocks, block_size, num_heads, head_size]
-      num_heads = key_cache.size(2);
-      block_size = key_cache.size(1);
-      block_stride_in_elems = key_cache.stride(0);
-      key_offset = 0;
-    }
+    num_kv_heads          = key_cache_ref.size(2);
+    block_size            = key_cache_ref.size(1);
+    block_stride_in_elems = key_cache_ref.stride(0);
   }
-  
-  dim3 grid(num_tokens);
-  dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(key_cache));
+
+  dim3 grid(num_tokens, num_layers);
+  dim3 block(std::min<int64_t>((int64_t)num_kv_heads * (rot_dim / 2), 512LL));
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key_cache_ref));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  
+
   LMC_DISPATCH_FLOATING_TYPES(
-      key_cache.scalar_type(), "rotary_embedding_paged_inplace", [&] {
+      key_cache_ref.scalar_type(), "rotary_embedding_paged_fused_multi_layer", [&] {
         if (is_neox) {
-          lmc::rotary_embedding_paged_kernel_fused<scalar_t, true>
+          lmc::rotary_embedding_paged_fused_multi_layer_kernel<scalar_t, true>
               <<<grid, block, 0, stream>>>(
                   old_positions.data_ptr<int64_t>(),
                   new_positions.data_ptr<int64_t>(),
                   slot_mapping.data_ptr<int64_t>(),
-                  key_cache.data_ptr<scalar_t>(),
+                  key_cache_ptrs.data_ptr<int64_t>(),
                   cos_sin_cache.data_ptr<scalar_t>(),
-                  rot_dim, num_heads, head_size, block_size,
-                  block_stride_in_elems, key_offset);
+                  rot_dim, num_kv_heads, (int)head_size, block_size,
+                  (int)block_stride_in_elems, key_offset);
         } else {
-          lmc::rotary_embedding_paged_kernel_fused<scalar_t, false>
+          lmc::rotary_embedding_paged_fused_multi_layer_kernel<scalar_t, false>
               <<<grid, block, 0, stream>>>(
                   old_positions.data_ptr<int64_t>(),
                   new_positions.data_ptr<int64_t>(),
                   slot_mapping.data_ptr<int64_t>(),
-                  key_cache.data_ptr<scalar_t>(),
+                  key_cache_ptrs.data_ptr<int64_t>(),
                   cos_sin_cache.data_ptr<scalar_t>(),
-                  rot_dim, num_heads, head_size, block_size,
-                  block_stride_in_elems, key_offset);
+                  rot_dim, num_kv_heads, (int)head_size, block_size,
+                  (int)block_stride_in_elems, key_offset);
         }
       });
 }

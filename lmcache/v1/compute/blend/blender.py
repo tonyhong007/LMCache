@@ -6,7 +6,6 @@ from typing import Optional, Union
 
 # Third Party
 import torch
-
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.compute.attention.metadata import LMCAttnMetadata
@@ -61,20 +60,49 @@ class LMCBlender:
             positions=None,
         )
 
-        # Chunk boundaries for GPU-direct SAGE blending (set externally)
-        self.chunk_boundaries: Optional[list[int]] = None
-        
-        # Flag indicating whether RoPE adjustment is needed during blending
-        # When True: chunks were prefilled without position offsets, need to adjust RoPE
-        # When False: chunks were prefilled with correct position offsets (optimization)
-        # NOTE: RoPE adjustment is now done in gpu_connector.batched_from_gpu_to_buffer
-        # using fused_rotary_emb for efficiency (similar to batched_to_gpu for CPU retrieval)
-        self.needs_rope_adjustment: bool = False
-        
-        # Precomputed boundary indices for optimization (set by compute_layer)
-        # When set, process_qkv can skip diff_k computation and use these indices directly
-        self.precomputed_boundary_indices: Optional[torch.Tensor] = None
         self.enable_timing = os.getenv("SAGE_ENABLE_TIMING", "0").lower() == "1"
+        # Selected token indices from the last process_qkv check layer call.
+        # Persisted across metadata resets so the adapter can retrieve which
+        # token positions were selected after blend_from_gpu completes.
+        self._last_imp_indices: Optional[torch.Tensor] = None
+        # Full ranking of all N tokens by diff_k score from the scoring step.
+        # The incremental strategy slices this into per-decode-step batches
+        # (e.g., tokens ranked 1-500 for step 1, 501-1000 for step 2, etc.).
+        self._last_full_importance_ranking: Optional[torch.Tensor] = None
+        # Mean diff_k score from the last scoring step (for adaptive layerwise).
+        self._last_diff_k_mean: Optional[float] = None
+        # Layerwise boundary: M-row hidden states saved at end of pre-TTFT
+        # pass (blend_from_gpu with save_boundary=True). Allows fused
+        # injection to skip already-processed layers during decode.
+        self._scoring_boundary_hidden: Optional[torch.Tensor] = None
+        self._scoring_boundary_residual: Optional[torch.Tensor] = None
+        self._scoring_boundary_layer: int = 0
+        self._scoring_boundary_pos_to_row: Optional[torch.Tensor] = None
+
+    def _get_candidate_indices(
+        self,
+        attn_mask: Optional[torch.Tensor],
+        total_len: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if attn_mask is None:
+            return None
+        assert attn_mask.device == device, (
+            "Blend candidate mask must be on the same device as tensors: "
+            f"mask={attn_mask.device}, tensors={device}"
+        )
+        assert attn_mask.dtype == torch.bool, (
+            "Blend candidate mask must have bool dtype: "
+            f"got {attn_mask.dtype}"
+        )
+        assert attn_mask.ndim == 1 and attn_mask.numel() == total_len, (
+            "Blend candidate mask must be 1D with one value per token: "
+            f"shape={tuple(attn_mask.shape)}, expected=({total_len},)"
+        )
+        candidate_indices = torch.nonzero(attn_mask, as_tuple=False).flatten()
+        if candidate_indices.numel() == 0:
+            return torch.empty(0, dtype=torch.long, device=device)
+        return candidate_indices
 
     def process_qkv(
         self,
@@ -124,64 +152,119 @@ class LMCBlender:
             if q.is_cuda:
                 torch.cuda.synchronize()
             rotary_ms = (time.perf_counter() - rotary_t0) * 1000.0
+
         if layer_id in self.common_metadata.check_layers:
+            total_len = q.shape[0]
+            suffix_len = self.metadata.suffix_len
+            ratio = self.metadata.step_recompute_ratio
+            topk_num = 0
+            if ratio is None:
+                assert self.common_metadata.recomp_ratios is not None
+                ratio = self.common_metadata.recomp_ratios[0]
+
+            scoring_only = ratio <= 0.0
+            # Fast path: 0% ratio, no suffix, not incremental → skip everything
+            if scoring_only and suffix_len == 0 and not self.metadata.capture_full_ranking:
+                self.metadata.imp_indices = None
+                return q, k, v, residual, attn_output, attn_metadata
+            # Sync cacheblend at 0% with suffix: skip scoring, just recompute suffix
+            if scoring_only and suffix_len > 0 and not self.metadata.capture_full_ranking:
+                non_suffix_len = total_len - suffix_len
+                top_indices = torch.arange(
+                    non_suffix_len, total_len, device=q.device,
+                )
+                k, v = k[top_indices], v[top_indices]
+                q = q[top_indices]
+                residual = residual[top_indices]
+                self.metadata.imp_indices = top_indices
+                self.metadata.positions = self.metadata.positions[top_indices]
+                attn_output = attn_output[:top_indices.shape[0]]
+                attn_metadata.update_from_top_indices(top_indices)
+                self._last_imp_indices = top_indices.detach().clone()
+                old_k[top_indices] = k
+                old_v[top_indices] = v
+                return q, old_k, old_v, residual, attn_output, attn_metadata
+
             diff_t0 = 0.0
             if timing_enabled:
                 if q.is_cuda:
                     torch.cuda.synchronize()
                 diff_t0 = time.perf_counter()
+            candidate_indices = self._get_candidate_indices(
+                attn_mask=attn_mask,
+                total_len=total_len,
+                device=q.device,
+            )
+            if candidate_indices is not None and candidate_indices.numel() == 0:
+                self.metadata.imp_indices = None
+                return q, k, v, residual, attn_output, attn_metadata
+
+            # Compute diff_k only on non-suffix tokens; suffix is always
+            # recomputed (matching original CacheBlend's approach).
+            non_suffix_len = total_len - suffix_len
             diff_k = torch.sum(
-                (k.to(torch.float32) - old_k.to(torch.float32)) ** 2, dim=[1]
+                (k[:non_suffix_len].to(torch.float32)
+                 - old_k[:non_suffix_len].to(torch.float32)) ** 2,
+                dim=[1],
             )
-            total_len = diff_k.shape[0]
+            self._last_diff_k_mean = float(diff_k.mean().item())
+            if self.metadata.capture_full_ranking:
+                if candidate_indices is not None:
+                    # Filter candidate_indices to non-suffix range
+                    cand_mask = candidate_indices < non_suffix_len
+                    ns_candidates = candidate_indices[cand_mask]
+                    if ns_candidates.numel() > 0:
+                        score_view = diff_k[ns_candidates]
+                        ranked_local = torch.argsort(score_view, descending=True)
+                        full_ranking = ns_candidates[ranked_local]
+                    else:
+                        full_ranking = torch.argsort(diff_k, descending=True)
+                else:
+                    full_ranking = torch.argsort(diff_k, descending=True)
+                self._last_full_importance_ranking = full_ranking.detach().clone()
 
-            assert self.common_metadata.recomp_ratios is not None
+            if scoring_only:
+                self.metadata.imp_indices = None
+                return q, k, v, residual, attn_output, attn_metadata
 
-            candidate_indices = None
-            if attn_mask is not None:
-                assert attn_mask.device == diff_k.device, (
-                    "Blend candidate mask must be on the same device as diff_k: "
-                    f"mask={attn_mask.device}, diff_k={diff_k.device}"
-                )
-                assert attn_mask.dtype == torch.bool, (
-                    "Blend candidate mask must have bool dtype: "
-                    f"got {attn_mask.dtype}"
-                )
-                assert attn_mask.ndim == 1 and attn_mask.numel() == total_len, (
-                    "Blend candidate mask must be 1D with one value per token: "
-                    f"shape={tuple(attn_mask.shape)}, expected=({total_len},)"
-                )
-                candidate_indices = torch.nonzero(attn_mask, as_tuple=False).flatten()
-                assert candidate_indices.numel() > 0, (
-                    "Blend candidate mask cannot be empty"
-                )
-
-            # TODO(Jiayi): remove `[0]` hardcode
-            base_topk_num = int(total_len * self.common_metadata.recomp_ratios[0])
+            # Select topk from non-suffix tokens only
+            base_topk_num = int(non_suffix_len * ratio)
             base_topk_num = max(base_topk_num, 1)
-            effective_len = (
-                int(candidate_indices.numel()) if candidate_indices is not None else total_len
-            )
+            if candidate_indices is not None:
+                cand_mask = candidate_indices < non_suffix_len
+                ns_candidates = candidate_indices[cand_mask]
+                effective_len = int(ns_candidates.numel())
+            else:
+                ns_candidates = None
+                effective_len = non_suffix_len
             topk_num = min(base_topk_num, effective_len)
 
-            if candidate_indices is not None:
-                top_local_indices = torch.topk(diff_k[candidate_indices], k=topk_num).indices
-                top_indices = candidate_indices[top_local_indices]
+            if ns_candidates is not None and ns_candidates.numel() > 0:
+                top_local_indices = torch.topk(
+                    diff_k[ns_candidates], k=topk_num
+                ).indices
+                top_indices = ns_candidates[top_local_indices]
             else:
                 top_indices = torch.topk(diff_k, k=topk_num).indices
+
+            # Append suffix indices unless deferred (incremental mode).
+            if suffix_len > 0 and not self.metadata.defer_suffix:
+                suffix_indices = torch.arange(
+                    non_suffix_len, total_len,
+                    device=top_indices.device,
+                )
+                top_indices = torch.cat([top_indices, suffix_indices])
             top_indices, _ = torch.sort(top_indices)
 
             k, v = k[top_indices], v[top_indices]
             q = q[top_indices]
             residual = residual[top_indices]
 
-            logger.debug(f"Number of indices picked: {len(top_indices)}")
-
             self.metadata.imp_indices = top_indices
             self.metadata.positions = self.metadata.positions[top_indices]
-            attn_output = attn_output[:topk_num]
-
+            attn_output = attn_output[:len(top_indices)]
             attn_metadata.update_from_top_indices(top_indices)
+            self._last_imp_indices = self.metadata.imp_indices.detach().clone()
             if timing_enabled:
                 if q.is_cuda:
                     torch.cuda.synchronize()
@@ -314,130 +397,107 @@ class LMCBlender:
         """
         # TODO(Jiayi): store is currently not included in this function
 
+        max_layers_to_process = int(kwargs.get("max_layers_to_process", self.num_layers))
+        if max_layers_to_process <= 0:
+            raise ValueError(
+                "max_layers_to_process must be >= 1 for blend_layer_from_gpu"
+            )
+        max_layers_to_process = min(max_layers_to_process, self.num_layers)
+
+        self.metadata.positions = None
+
         layerwise_model_executor = self.layerwise_model.compute_layer(tokens)
 
-        # Use cache_engine.retrieve_layer_from_gpu to read directly from GPU paged memory
-        # This properly computes starts/ends from the token database
-        # Pass chunk_boundaries and needs_rope_adjustment so RoPE adjustment can be done
-        # in the gpu_connector (similar to how CPU version does it in batched_to_gpu)
         layerwise_gpu_retriever = self.cache_engine.retrieve_layer_from_gpu(
-            tokens, mask, 
-            chunk_boundaries=self.chunk_boundaries,
-            needs_rope_adjustment=self.needs_rope_adjustment,
+            tokens, mask,
             **kwargs
         )
 
         next(layerwise_gpu_retriever)
         yield
 
-        total_retrieve_ms = 0.0
-        total_compute_ms = 0.0
-        for layer_id in range(self.num_layers):
-            if self.enable_timing:
-                retrieve_start = torch.cuda.Event(enable_timing=True)
-                retrieve_end = torch.cuda.Event(enable_timing=True)
-                compute_start = torch.cuda.Event(enable_timing=True)
-                compute_end = torch.cuda.Event(enable_timing=True)
-                retrieve_start.record()
+        for layer_id in range(max_layers_to_process):
             next(layerwise_gpu_retriever)
-            if self.enable_timing:
-                retrieve_end.record()
-                compute_start.record()
             next(layerwise_model_executor)
-            if self.enable_timing:
-                compute_end.record()
-                torch.cuda.synchronize()
-                retrieve_ms = retrieve_start.elapsed_time(retrieve_end)
-                compute_ms = compute_start.elapsed_time(compute_end)
-                total_retrieve_ms += retrieve_ms
-                total_compute_ms += compute_ms
-                logger.info(
-                    "[BLEND_GPU_TIMING] Layer %d: retrieve_from_gpu=%.3fms, compute=%.3fms",
-                    layer_id,
-                    retrieve_ms,
-                    compute_ms,
-                )
             yield
-        
+
         # Final cleanup (write last layer back and finalize)
         next(layerwise_gpu_retriever)
 
         self.metadata.clean()
-        self.chunk_boundaries = None  # Clear chunk boundaries after blending
-        self.needs_rope_adjustment = False  # Clear RoPE adjustment flag after blending
-        if self.enable_timing:
-            logger.info(
-                "[BLEND_GPU_TIMING] SUMMARY: total_retrieve_from_gpu=%.3fms, total_compute=%.3fms",
-                total_retrieve_ms,
-                total_compute_ms,
-            )
         yield
 
     def blend_from_gpu(
         self,
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
-        chunk_boundaries: Optional[list[int]] = None,
-        needs_rope_adjustment: bool = False,
+        step_recompute_ratio: Optional[float] = None,
+        capture_full_ranking: bool = False,
+        save_boundary: bool = False,
+        suffix_len: int = 0,
+        defer_suffix: bool = False,
         **kwargs,
     ):
         """
         Perform blending by reading KV cache directly from GPU paged memory.
-        This is the main entry point for Sage concurrent prefill optimization.
 
-        Use this when the KV cache has already been computed via concurrent prefill
-        and is stored in GPU paged memory, avoiding the CPU memory round-trip.
-
-        :param tokens: The tokens to blend.
-        :param mask: Optional mask indicating which tokens need blending.
-        :param chunk_boundaries: Optional list of chunk boundary positions (e.g., [0, 2770, 4615, ...]).
-            When provided, positions at chunk boundaries are marked for recomputation
-            instead of using diff_k which fails for SAGE due to intra-chunk attention.
-        :param needs_rope_adjustment: Whether RoPE adjustment is needed for cached KV.
-            When True: chunks were prefilled without position offsets, so cached KV has 
-            incorrect RoPE that needs to be adjusted before blending.
-            When False (default): chunks were prefilled with correct position offsets,
-            so cached KV already has correct RoPE (optimization mode).
-        :param kwargs: Must include 'kvcaches' and 'slot_mapping'.
+        :param save_boundary: If True (layerwise only), save M-row boundary
+            hidden states at end of pass for fused injection at the next
+            layer group during decode.
+        :param suffix_len: Number of suffix tokens (e.g., query) that should
+            always be recomputed and excluded from diff_k selection.
+        :param defer_suffix: If True, exclude suffix from this pass
+            (for incremental mode — suffix recomputed on final step).
         """
         if isinstance(tokens, list):
             tokens = torch.tensor(tokens).cuda()
         self.metadata.attn_mask = mask
+        self.metadata.step_recompute_ratio = step_recompute_ratio
+        self.metadata.capture_full_ranking = capture_full_ranking
+        self.metadata.suffix_len = suffix_len
+        self.metadata.defer_suffix = defer_suffix
+        self._last_imp_indices = None
+        self._last_full_importance_ranking = None
+        self._last_diff_k_mean = None
+        max_layers_to_process = int(
+            kwargs.get("max_layers_to_process", self.num_layers)
+        )
+        if max_layers_to_process <= 0:
+            raise ValueError("max_layers_to_process must be >= 1 in blend_from_gpu")
+        max_layers_to_process = min(max_layers_to_process, self.num_layers)
 
-        blend_start_event = None
-        blend_end_event = None
-        blend_wall_t0 = None
-        if self.enable_timing:
-            blend_start_event = torch.cuda.Event(enable_timing=True)
-            blend_end_event = torch.cuda.Event(enable_timing=True)
-            blend_start_event.record()
-            blend_wall_t0 = time.perf_counter()
+        kwargs["max_layers_to_process"] = max_layers_to_process
+        kwargs.pop("selected_token_indices", None)
 
-        # Set chunk boundaries for process_qkv to use
-        self.chunk_boundaries = chunk_boundaries
-        # Set flag for RoPE adjustment
-        self.needs_rope_adjustment = needs_rope_adjustment
-        if chunk_boundaries is not None:
-            logger.debug(
-                f"[SAGE_BLEND] Using explicit chunk_boundaries: {chunk_boundaries}, "
-                f"needs_rope_adjustment={needs_rope_adjustment}"
-            )
-
-        layerwise_blender = self.blend_layer_from_gpu(tokens, mask, **kwargs)
-
-        for i in range(self.num_layers + 2):
+        layerwise_blender = self.blend_layer_from_gpu(
+            tokens,
+            mask,
+            **kwargs,
+        )
+        for _ in range(max_layers_to_process + 2):
             next(layerwise_blender)
-        if self.enable_timing and blend_start_event is not None and blend_end_event is not None:
-            assert blend_wall_t0 is not None
-            blend_end_event.record()
-            torch.cuda.synchronize()
-            wall_time_ms = (time.perf_counter() - blend_wall_t0) * 1000.0
-            gpu_time_ms = blend_start_event.elapsed_time(blend_end_event)
-            logger.info(
-                "[BLEND_FROM_GPU_TIMING] blend_from_gpu() wall_time=%.3fms, gpu_time=%.3fms "
-                "for %d tokens across %d layers",
-                wall_time_ms,
-                gpu_time_ms,
-                int(tokens.shape[0]),
-                self.num_layers,
-            )
+
+        # Layerwise boundary: save M-row hidden states at end of pass so
+        # fused injection can skip already-processed layers during decode.
+        if capture_full_ranking and save_boundary:
+            _bnd_h = getattr(self.layerwise_model, "_layerwise_out_hidden", None)
+            _bnd_r = getattr(self.layerwise_model, "_layerwise_out_residual", None)
+            if _bnd_h is not None and _bnd_r is not None:
+                _N_total = int(tokens.shape[0])
+                _imp = self._last_imp_indices
+                _ranking = self._last_full_importance_ranking
+                assert _ranking is not None and _ranking.numel() > 0, (
+                    "capture_full_ranking=True but no ranking available"
+                )
+                _indices = (_imp if _imp is not None and _bnd_h.shape[0] == _imp.numel()
+                            else _ranking)
+                _indices = _indices.to(device=_bnd_h.device, dtype=torch.long)
+                M = int(_indices.numel())
+                self._scoring_boundary_hidden = _bnd_h.detach().clone()
+                self._scoring_boundary_residual = _bnd_r.detach().clone()
+                self._scoring_boundary_layer = max_layers_to_process
+                _pos_to_row = torch.full(
+                    (_N_total,), -1, dtype=torch.long, device=_bnd_h.device,
+                )
+                _pos_to_row[_indices] = torch.arange(M, device=_bnd_h.device)
+                self._scoring_boundary_pos_to_row = _pos_to_row

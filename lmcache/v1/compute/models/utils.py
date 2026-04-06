@@ -45,6 +45,11 @@ def infer_model_from_vllm(vllm_model, blender, enable_sparse: bool = False):
         from lmcache.v1.compute.models.qwen3 import LMCQwen3Model
 
         return LMCQwen3Model(vllm_model, blender, enable_sparse)
+    elif model_name == "Qwen3LLMForCausalLM":
+        # Qwen3-VL language backbone — same attention as Qwen3
+        from lmcache.v1.compute.models.qwen3 import LMCQwen3Model
+
+        return LMCQwen3Model(vllm_model, blender, enable_sparse)
     else:
         # TODO(Jiayi): Add support for more models
         raise NotImplementedError(

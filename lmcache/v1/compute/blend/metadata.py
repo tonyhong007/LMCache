@@ -27,8 +27,22 @@ class LMCBlendMetadata:
     imp_indices: Optional[torch.Tensor] = None
     attn_mask: Optional[torch.Tensor] = None
     positions: Optional[torch.Tensor] = None
+    # Optional per-step override for recompute ratio used by incremental blending.
+    step_recompute_ratio: Optional[float] = None
+    # Whether to capture a full token ranking during this blend run.
+    capture_full_ranking: bool = False
+    # Number of suffix tokens (e.g., query) that should always be recomputed
+    # and excluded from diff_k selection. 0 means no suffix handling.
+    suffix_len: int = 0
+    # When True, defer suffix recomputation to a later pass (incremental mode).
+    # When False, suffix is included in this pass (sync cacheblend).
+    defer_suffix: bool = False
 
     def clean(self):
         self.imp_indices = None
         self.attn_mask = None
         self.positions = None
+        self.step_recompute_ratio = None
+        self.capture_full_ranking = False
+        self.suffix_len = 0
+        self.defer_suffix = False

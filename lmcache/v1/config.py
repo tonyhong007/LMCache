@@ -120,6 +120,26 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "blend_min_tokens": {"type": int, "default": 256, "env_converter": int},
     "blend_special_str": {"type": str, "default": " # # ", "env_converter": str},
+    "blend_incremental_strategy": {
+        "type": str,
+        "default": "none",
+        "env_converter": str,
+    },
+    "blend_incremental_max_ratio": {
+        "type": Optional[float],
+        "default": None,
+        "env_converter": float,
+    },
+    "tokenwise_step_ratio": {
+        "type": Optional[float],
+        "default": None,
+        "env_converter": float,
+    },
+    "layerwise_step_num_layers": {
+        "type": int,
+        "default": 6,
+        "env_converter": int,
+    },
     # P2P configurations
     "enable_p2p": {
         "type": bool,

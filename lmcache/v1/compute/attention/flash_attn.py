@@ -114,16 +114,20 @@ class LMCFlashAttnBackend(AttentionInterface):
     def init_attn_metadata(
         self,
         input_ids: torch.tensor,
+        num_queries: int = None,
         **kwargs,
     ) -> LMCFlashAttnMetadata:
         seq_len = input_ids.shape[0]
         device = input_ids.device
+        # num_queries lets callers specify a different number of query tokens
+        # than KV tokens (e.g. compact replay: M queries attending to N keys).
+        q_len = num_queries if num_queries is not None else seq_len
         return LMCFlashAttnMetadata(
             query_start_loc=torch.tensor(
-                [0, seq_len], dtype=torch.int32, device=device
+                [0, q_len], dtype=torch.int32, device=device
             ),
             seq_lens=torch.tensor([seq_len], device=device),
             cu_seqlens_k=torch.tensor([0, seq_len], dtype=torch.int32, device=device),
-            max_query_len=seq_len,
+            max_query_len=q_len,
             max_seq_len=seq_len,
         )

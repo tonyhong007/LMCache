@@ -1092,6 +1092,12 @@ class LMCacheEngine:
             num_required_tokens = torch.sum(mask).item()
         else:
             num_required_tokens = len(tokens)
+        max_layers_to_process = int(kwargs.get("max_layers_to_process", self.num_layers))
+        if max_layers_to_process <= 0:
+            raise ValueError(
+                "max_layers_to_process must be >= 1 for retrieve_layer_from_gpu"
+            )
+        max_layers_to_process = min(max_layers_to_process, self.num_layers)
 
         starts = []
         ends = []
@@ -1110,32 +1116,22 @@ class LMCacheEngine:
             "retrieve_layer_from_gpu operation"
         )
 
-        # Get chunk_boundaries and needs_rope_adjustment for RoPE adjustment
         chunk_boundaries = kwargs.get("chunk_boundaries", None)
-        needs_rope_adjustment = kwargs.get("needs_rope_adjustment", False)
+        read_only = bool(kwargs.get("read_only", False))
         logger.debug(
-            f"[GPU-direct] chunk_boundaries={chunk_boundaries}, "
-            f"needs_rope_adjustment={needs_rope_adjustment}"
+            f"[GPU-direct] chunk_boundaries={chunk_boundaries}"
         )
 
         # For zero-copy requests, use full token range (0 to len(tokens))
         # The KV is already in GPU paged memory from chunk prefilling
         starts = [0]
         ends = [len(tokens)]
-        logger.info(
-            f"[GPU-direct] SAGE_ZERO_COPY: Using full token range [0, {len(tokens)}]"
-        )
 
         if starts:
             assert isinstance(
                 self.gpu_connector,
                 VLLMBufferLayerwiseGPUConnector,
             ), "retrieve_layer_from_gpu requires VLLMBufferLayerwiseGPUConnector"
-
-            logger.info(
-                f"[GPU-direct] Start layerwise retrieve from GPU for {len(tokens)} tokens "
-                f"across {self.num_layers} layers"
-            )
 
             # Use batched_from_gpu_to_buffer instead of batched_to_gpu
             gpu_buffer_reader = self.gpu_connector.batched_from_gpu_to_buffer(
@@ -1145,22 +1141,21 @@ class LMCacheEngine:
             next(gpu_buffer_reader)
             yield
 
-            for layer_id in range(self.num_layers):
-                # Read layer from paged GPU memory (and write previous layer back)
-                # The GPU connector does:
-                #   - If layer_id > 0: write layer (layer_id-1) back to paged memory
-                #   - If layer_id < num_layers: read layer_id from paged memory
+            for layer_id in range(max_layers_to_process):
+                # Read layer from paged GPU memory. In read-only mode, the GPU
+                # connector skips paged writeback and this loop becomes a pure
+                # read/compute stream across layers.
                 next(gpu_buffer_reader)
                 yield
 
-            # Write the last layer back to paged memory
+            # Advance the generator through its final layer bookkeeping.
             next(gpu_buffer_reader)
 
             # Final cleanup
             next(gpu_buffer_reader)
         else:
             # If no tokens to process, still yield to avoid StopIteration
-            for layer_id in range(self.num_layers):
+            for _ in range(max_layers_to_process):
                 yield
 
         logger.debug(

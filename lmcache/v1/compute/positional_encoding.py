@@ -84,14 +84,8 @@ class FusedRope:
 
 
 class PagedRopeInplace:
-    """
-    Apply RoPE adjustment directly on paged KV cache memory.
-    This eliminates the need for an intermediate contiguous buffer,
-    which saves ~1GB memory allocation and copy overhead.
-    
-    The kernel reads K values from paged memory using slot_mapping,
-    applies inverse RoPE (undo old position), applies forward RoPE (new position),
-    and writes back to the same paged memory location.
+    """Holds RoPE parameters (cos_sin_cache, is_neox_style) for the fused
+    multi-layer kernel called by gpu_connector.rope_correction_inplace.
     """
 
     def __init__(self, rope, is_neox_style):
@@ -100,57 +94,6 @@ class PagedRopeInplace:
         self.head_size = rope.head_size
         self.cos_sin_cache = rope.cos_sin_cache
         self._cos_sin_cache_device = None
-
-    def apply_inplace(
-        self,
-        old_positions: torch.Tensor,    # [num_tokens]
-        new_positions: torch.Tensor,    # [num_tokens]
-        slot_mapping: torch.Tensor,     # [num_tokens]
-        key_cache: torch.Tensor,        # Paged KV cache
-        vllm_two_major: bool = True,    # True if [2, num_blocks, ...], False if [num_blocks, 2, ...]
-    ):
-        """
-        Apply RoPE adjustment in-place on paged memory.
-        
-        Args:
-            old_positions: Original positions (e.g., chunk-local positions starting from 0)
-            new_positions: Target positions (e.g., absolute positions in the full sequence)
-            slot_mapping: Maps token index to slot in paged memory
-            key_cache: The paged KV cache tensor
-            vllm_two_major: Memory layout flag
-        """
-        if old_positions.numel() == 0:
-            return
-            
-        # Ensure cos_sin_cache is on the right device (cache for efficiency)
-        if self._cos_sin_cache_device is None or self._cos_sin_cache_device.device != key_cache.device:
-            import time
-            t0 = time.perf_counter()
-            self._cos_sin_cache_device = self.cos_sin_cache.to(key_cache.device)
-            t1 = time.perf_counter()
-            logger.info(f"[PagedRopeInplace] cos_sin_cache.to(device) took {(t1-t0)*1000:.2f}ms, "
-                        f"shape={self.cos_sin_cache.shape}, size={self.cos_sin_cache.numel() * self.cos_sin_cache.element_size() / 1024 / 1024:.2f}MB")
-        
-        lmc_ops.rotary_embedding_paged_inplace(
-            old_positions,
-            new_positions,
-            slot_mapping,
-            key_cache,
-            self._cos_sin_cache_device,
-            self.head_size,
-            self.is_neox_style,
-            vllm_two_major,
-        )
-
-    def __call__(
-        self,
-        old_positions: torch.Tensor,
-        new_positions: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        key_cache: torch.Tensor,
-        vllm_two_major: bool = True,
-    ):
-        return self.apply_inplace(old_positions, new_positions, slot_mapping, key_cache, vllm_two_major)
 
 
 def validate_rope_params(
