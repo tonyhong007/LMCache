@@ -153,6 +153,34 @@ class LMCBlender:
                 torch.cuda.synchronize()
             rotary_ms = (time.perf_counter() - rotary_t0) * 1000.0
 
+        # --- Magnet Stage II: pre-selected indices, slice + write-back per layer ---
+        # At layers before check_layer: pass through unchanged (full N tokens).
+        # At check_layer: slice q/k/v/residual to the selected K tokens.
+        # At all layers: write recomputed K, V back into paged cache at
+        # the selected positions.
+        if self.metadata.magnet_preselected_indices is not None:
+            top_indices = self.metadata.magnet_preselected_indices.to(
+                device=q.device, dtype=torch.long,
+            )
+            if self.metadata.imp_indices is None:
+                # Slice at check_layer; pass through unchanged before it.
+                if layer_id not in self.common_metadata.check_layers:
+                    return q, k, v, residual, attn_output, attn_metadata
+                q = q[top_indices]
+                k = k[top_indices]
+                v = v[top_indices]
+                residual = residual[top_indices]
+                self.metadata.imp_indices = top_indices
+                if self.metadata.positions is not None:
+                    self.metadata.positions = self.metadata.positions[top_indices]
+                attn_output = attn_output[:top_indices.shape[0]]
+                attn_metadata.update_from_top_indices(top_indices)
+                self._last_imp_indices = top_indices.detach().clone()
+            # Write blended K, V back at every layer for selected tokens.
+            old_k[self.metadata.imp_indices] = k
+            old_v[self.metadata.imp_indices] = v
+            return q, old_k, old_v, residual, attn_output, attn_metadata
+
         if layer_id in self.common_metadata.check_layers:
             total_len = q.shape[0]
             suffix_len = self.metadata.suffix_len
@@ -247,8 +275,11 @@ class LMCBlender:
             else:
                 top_indices = torch.topk(diff_k, k=topk_num).indices
 
-            # Append suffix indices unless deferred (incremental mode).
-            if suffix_len > 0 and not self.metadata.defer_suffix:
+            # Append suffix when all layers are processed in this
+            # pass (sync cacheblend or ptt=1.0). For incremental
+            # (ptt<1.0), suffix is deferred to the final step to
+            # avoid conflicts with the fused inject batch.
+            if suffix_len > 0 and self.metadata.include_suffix:
                 suffix_indices = torch.arange(
                     non_suffix_len, total_len,
                     device=top_indices.device,
@@ -405,6 +436,7 @@ class LMCBlender:
         max_layers_to_process = min(max_layers_to_process, self.num_layers)
 
         self.metadata.positions = None
+        self.metadata.imp_indices = None
 
         layerwise_model_executor = self.layerwise_model.compute_layer(tokens)
 
@@ -435,7 +467,7 @@ class LMCBlender:
         capture_full_ranking: bool = False,
         save_boundary: bool = False,
         suffix_len: int = 0,
-        defer_suffix: bool = False,
+        include_suffix: bool = False,
         **kwargs,
     ):
         """
@@ -446,8 +478,10 @@ class LMCBlender:
             layer group during decode.
         :param suffix_len: Number of suffix tokens (e.g., query) that should
             always be recomputed and excluded from diff_k selection.
-        :param defer_suffix: If True, exclude suffix from this pass
-            (for incremental mode — suffix recomputed on final step).
+        :param include_suffix: If True, append suffix tokens to M selection.
+            Set True when all recomputation happens in this pass (no
+            incremental steps follow). Set False when incremental steps
+            will handle the suffix later.
         """
         if isinstance(tokens, list):
             tokens = torch.tensor(tokens).cuda()
@@ -455,7 +489,8 @@ class LMCBlender:
         self.metadata.step_recompute_ratio = step_recompute_ratio
         self.metadata.capture_full_ranking = capture_full_ranking
         self.metadata.suffix_len = suffix_len
-        self.metadata.defer_suffix = defer_suffix
+        self.metadata.include_suffix = include_suffix
+        self.metadata.imp_indices = None
         self._last_imp_indices = None
         self._last_full_importance_ranking = None
         self._last_diff_k_mean = None

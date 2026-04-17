@@ -34,9 +34,11 @@ class LMCBlendMetadata:
     # Number of suffix tokens (e.g., query) that should always be recomputed
     # and excluded from diff_k selection. 0 means no suffix handling.
     suffix_len: int = 0
-    # When True, defer suffix recomputation to a later pass (incremental mode).
-    # When False, suffix is included in this pass (sync cacheblend).
-    defer_suffix: bool = False
+    include_suffix: bool = False
+    # Pass 2 only: pre-selected indices (1D long tensor) to use directly
+    # instead of scoring. process_qkv slices + writes back at every layer
+    # without running the magnet scorer.
+    magnet_preselected_indices: Optional[torch.Tensor] = None
 
     def clean(self):
         self.imp_indices = None
@@ -45,4 +47,5 @@ class LMCBlendMetadata:
         self.step_recompute_ratio = None
         self.capture_full_ranking = False
         self.suffix_len = 0
-        self.defer_suffix = False
+        self.include_suffix = False
+        self.magnet_preselected_indices = None

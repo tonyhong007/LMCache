@@ -49,6 +49,7 @@ from lmcache.v1.compute.blend.incremental_strategy import (
     IncrementalBlendState,
     IncrementalBlendStrategy,
     LayerWiseIncrementalBlendStrategy,
+    MagnetIncrementalBlendStrategy,
     TokenWiseIncrementalBlendStrategy,
     build_incremental_blend_strategy,
 )
@@ -294,6 +295,9 @@ class ReqMeta:
     token_ids: list[int]  # torch.Tensor
     # Slot mapping
     slot_mapping: torch.Tensor
+    # Full allocated block IDs (may exceed ceil(len(token_ids)/block_size)
+    # under SAGE zero-copy when chunks contribute partial-last-block extras).
+    allocated_block_ids: Optional[torch.Tensor] = None
 
     # Whether is last prefill or not
     is_last_prefill: bool = False
@@ -447,6 +451,7 @@ class ReqMeta:
             req_id=tracker.req_id,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
+            allocated_block_ids=block_ids,
             is_last_prefill=is_last_prefill,
             save_spec=save_spec,
             load_spec=load_spec,
@@ -477,9 +482,15 @@ class SageMethod(str, Enum):
     CACHEBLEND = "cacheblend"              # sync CacheBlend
     CACHEBLEND_TOKENWISE = "cacheblend-tokenwise"
     CACHEBLEND_LAYERWISE = "cacheblend-layerwise"
+    MAGNET = "magnet"                      # query-aware adaptive (ProphetKV-style)
 
 
 class LMCacheConnectorV1Impl:
+    # Shared across all adapter instances in the same process (WORKER + SCHEDULER).
+    # Used to propagate early_blend_done from sage_process_layer (WORKER adapter)
+    # to the blend_from_gpu check (SCHEDULER adapter).
+    _shared_early_blend_done: dict[str, bool] = {}
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -587,6 +598,8 @@ class LMCacheConnectorV1Impl:
             self._sage_method = SageMethod.CACHEBLEND_LAYERWISE
         elif isinstance(self._incremental_blend_strategy, TokenWiseIncrementalBlendStrategy):
             self._sage_method = SageMethod.CACHEBLEND_TOKENWISE
+        elif isinstance(self._incremental_blend_strategy, MagnetIncrementalBlendStrategy):
+            self._sage_method = SageMethod.MAGNET
         else:
             self._sage_method = SageMethod.CACHEBLEND
         self._sync_cacheblend = (
@@ -596,6 +609,8 @@ class LMCacheConnectorV1Impl:
             "[SAGE_CONFIG] sage_method=%s",
             self._sage_method.value,
         )
+        # req_id → (slot_mapping, num_tokens) for deferred hash firing
+        self._sage_suffix_rerecompute_pending: set[str] = set()
         # req_id → {positions, token_ids, slots} for next-step injection
         self._fused_inject_pending: dict[str, dict] = {}
         # req_ids that had injection in the current model forward step
@@ -829,9 +844,6 @@ class LMCacheConnectorV1Impl:
             kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
 
     def _get_or_create_sage_incremental_state(self, req_id: str) -> Optional[IncrementalBlendState]:
-        strategy = getattr(self, "_incremental_blend_strategy", None)
-        if strategy is None:
-            return None
         if req_id not in self._sage_incremental_states:
             self._sage_incremental_states[req_id] = IncrementalBlendState()
             logger.info(
@@ -885,6 +897,7 @@ class LMCacheConnectorV1Impl:
         state = self._sage_incremental_states.pop(req_id, None)
         self._sage_pending_blend_launch_t0.pop(req_id, None)
         self._sage_cached_prompt_inputs.pop(req_id, None)
+        LMCacheConnectorV1Impl._shared_early_blend_done.pop(req_id, None)
         self._sage_rope_adjusted_requests.discard(req_id)
         self._sage_incremental_completed_requests.discard(req_id)
         self._fused_inject_pending.pop(req_id, None)
@@ -960,21 +973,35 @@ class LMCacheConnectorV1Impl:
         chunk_boundaries: list[int],
         slot_mapping: torch.Tensor,
         num_tokens: int,
-        block_table: torch.Tensor,
-        block_table_idx: int,
+        rope_block_table: torch.Tensor,
         kvcaches: list,
+        layer_range: tuple[int, int] | None = None,
+        rope_only: bool = False,
     ) -> None:
-        """RoPE correction + virtual→contiguous KV remap for all layers.
+        """RoPE correction + virtual→contiguous KV remap.
 
         1. Compute virtual slot mapping from chunk boundaries.
         2. Correct RoPE at virtual slots (chunk-local → absolute positions).
-        3. Copy KV from virtual to contiguous slots for all layers.
-        After this, all KV is at contiguous slots for decode.
+        3. Copy KV from virtual to contiguous slots.
+
+        If layer_range is None, processes all layers and marks the request
+        as RoPE-adjusted. If layer_range is (start, end), only processes
+        layers [start, end) and does NOT mark the request as adjusted
+        (caller must call again for remaining layers later).
+
+        This partial mode is used by early-blend to RoPE-correct only the
+        blend layers (0-1) while drain threads are still writing higher
+        layers. The remaining layers are corrected later during
+        _launch_final_request.
+
+        rope_block_table is the per-request block_id list, derived from
+        the request's slot_mapping (NOT from attn_metadata.block_table[idx]
+        which uses the wrong indexing for multi-request batches).
         """
-        assert block_table is not None and block_table_idx < block_table.shape[0], (
+        assert rope_block_table is not None, (
             f"RoPE prepass: no block_table for {req_id}"
         )
-        rope_block_table = block_table[block_table_idx].to(dtype=torch.int64).contiguous()
+        rope_block_table = rope_block_table.to(dtype=torch.int64).contiguous()
 
         virtual_sm = self._compute_virtual_slot_mapping(
             contiguous_slot_mapping=slot_mapping[:num_tokens],
@@ -983,33 +1010,63 @@ class LMCacheConnectorV1Impl:
             block_table=rope_block_table,
         )
 
-        self.blender.gpu_connector.rope_correction_inplace(
-            slot_mapping=virtual_sm,
-            chunk_boundaries=chunk_boundaries,
-            num_tokens=num_tokens,
-            kvcaches=kvcaches,
-        )
+        layer_start = 0
+        layer_end = len(kvcaches)
+        if layer_range is not None:
+            layer_start, layer_end = layer_range
 
-        # Copy KV from virtual to contiguous slots for all layers.
-        contiguous_sm = slot_mapping[:num_tokens].to(
-            device=virtual_sm.device, dtype=torch.long,
-        )
+        # RoPE correction: the fused kernel operates on all layers at
+        # once via key_cache_ptrs. For partial mode, we temporarily set
+        # the gpu_connector's kvcaches to just the target layers so the
+        # fused kernel only corrects those layers' KV. We save and
+        # restore the original kvcaches to avoid corrupting the
+        # connector's state.
         gc = self.blender.gpu_connector
-        gc._lazy_initialize_buffer(kvcaches)
-        buf = gc.gpu_buffer_allocator.allocate(
-            gc.get_shape(num_tokens), gc.dtype, MemoryFormat.KV_2TD,
-        )
-        for li in range(len(kvcaches)):
-            lmc_ops.single_layer_kv_transfer(
-                buf.tensor, kvcaches[li], virtual_sm,
-                True, False, gc.vllm_two_major, gc.use_mla,
+        saved_kvcaches = gc.kvcaches
+        saved_num_layers = getattr(gc, "num_layers", None)
+        target_kvcaches = kvcaches[layer_start:layer_end]
+        if target_kvcaches:
+            # Temporarily set num_layers to match the target subset so
+            # the fused kernel's key_cache_ptrs loop stays in bounds.
+            gc.num_layers = len(target_kvcaches)
+            self.blender.gpu_connector.rope_correction_inplace(
+                slot_mapping=virtual_sm,
+                chunk_boundaries=chunk_boundaries,
+                num_tokens=num_tokens,
+                kvcaches=target_kvcaches,
             )
-            lmc_ops.single_layer_kv_transfer(
-                buf.tensor, kvcaches[li], contiguous_sm,
-                False, False, gc.vllm_two_major, gc.use_mla,
+        # Restore original state on the connector.
+        gc.kvcaches = saved_kvcaches
+        if saved_num_layers is not None:
+            gc.num_layers = saved_num_layers
+
+        # Copy KV from virtual to contiguous slots (skip if rope_only).
+        # rope_only mode is used by early-blend: it only needs the RoPE
+        # correction (so the blend reads correctly-positioned K values)
+        # but should NOT remap because the blend's slot_mapping points
+        # to virtual slots. The full remap happens later during the
+        # parent's first forward step.
+        if not rope_only:
+            contiguous_sm = slot_mapping[:num_tokens].to(
+                device=virtual_sm.device, dtype=torch.long,
             )
-        buf.ref_count_down()
-        self._sage_rope_adjusted_requests.add(req_id)
+            gc2 = self.blender.gpu_connector
+            gc2._lazy_initialize_buffer(kvcaches)
+            buf = gc2.gpu_buffer_allocator.allocate(
+                gc2.get_shape(num_tokens), gc2.dtype, MemoryFormat.KV_2TD,
+            )
+            for li in range(layer_start, layer_end):
+                lmc_ops.single_layer_kv_transfer(
+                    buf.tensor, kvcaches[li], virtual_sm,
+                    True, False, gc2.vllm_two_major, gc2.use_mla,
+                )
+                lmc_ops.single_layer_kv_transfer(
+                    buf.tensor, kvcaches[li], contiguous_sm,
+                    False, False, gc2.vllm_two_major, gc2.use_mla,
+                )
+            buf.ref_count_down()
+        if layer_range is None:
+            self._sage_rope_adjusted_requests.add(req_id)
 
     def _run_tokenwise_pre_ttft(
         self,
@@ -1041,9 +1098,9 @@ class LMCacheConnectorV1Impl:
             sage_token_mask,
             step_recompute_ratio=pre_ttft_ratio if pre_ttft_ratio > 0 else None,
             capture_full_ranking=True,
-            save_boundary=True,  # Save M-row boundary for tokenwise decode injection
+            save_boundary=True,
             suffix_len=suffix_len,
-            defer_suffix=True,  # Suffix recomputed on final incremental step
+            include_suffix=(pre_ttft_ratio >= 1.0),
             kvcaches=kvcaches,
             slot_mapping=blend_slot_mapping,
             block_table=blend_block_table,
@@ -1076,6 +1133,26 @@ class LMCacheConnectorV1Impl:
             state.cumulative_ratio = float(pre_ttft_ratio)
             state.pre_ttft_recomputed_tokens = pre_ttft_count
             state.decode_step = max(state.decode_step, 1)
+            state.query_token_count = suffix_len
+            state._tw_cursor = 0
+            state._tw_tokens_emitted = 0
+            state._tw_prev_ratio = float(pre_ttft_ratio)
+            # Snapshot the scoring boundary into per-request state so that
+            # later decode-step injection reads the right tensors even if
+            # other concurrent requests overwrite the shared blender
+            # `_scoring_boundary_*` fields between now and then. Cloned
+            # because the blender owns the underlying buffers.
+            _bnd_h = self.blender._scoring_boundary_hidden
+            _bnd_r = self.blender._scoring_boundary_residual
+            _bnd_l = self.blender._scoring_boundary_layer
+            _bnd_p2r = self.blender._scoring_boundary_pos_to_row
+            if _bnd_h is not None:
+                state.tokenwise_boundary_hidden = _bnd_h.clone()
+            if _bnd_r is not None:
+                state.tokenwise_boundary_residual = _bnd_r.clone()
+            state.tokenwise_boundary_layer = _bnd_l
+            if _bnd_p2r is not None:
+                state.tokenwise_boundary_pos_to_row = _bnd_p2r.clone()
 
         logger.info(
             "[SAGE_CB_INC_FUSED] request=%s pre-TTFT complete: "
@@ -1084,6 +1161,197 @@ class LMCacheConnectorV1Impl:
             req_id, N, pre_ttft_ratio, pre_ttft_count,
             int(remaining_ranking.numel()), int(full_ranking.numel()),
         )
+
+    def _run_magnet_pre_ttft(
+        self,
+        req_id: str,
+        blend_tokens: torch.Tensor,
+        sage_token_mask: torch.Tensor,
+        blend_slot_mapping: torch.Tensor,
+        blend_block_table: Optional[torch.Tensor],
+        kvcaches: list,
+        sage_zero_copy: bool,
+        state: Any,
+        suffix_len: int = 0,
+        chunk_boundaries: Optional[list[int]] = None,
+    ) -> None:
+        """Magnet pre-TTFT: ProphetKV Algorithm 1 (two-pass).
+
+        Pass 1 (Stage I — lightweight query-only scoring): runs ONLY the
+        suffix/query tokens through all L layers via
+        magnet_query_only_score(). At each layer, computes
+        α_l(t) = column_sum(softmax(Q_s · K'_context / √d)) using the
+        cached context K'. Per-layer cost is O(|Q_s| × s) instead of
+        O(s^2) of a full-context pass. Returns fused ᾱ(t); caller
+        applies the threshold.
+
+        Pass 2 (Stage II — targeted recompute): runs blend_from_gpu with
+        magnet_preselected_indices set. process_qkv slices at layer 0 to
+        the selected tokens and writes back K/V at every layer.
+
+        Per-request state is initialized so decode-time hooks + retries
+        know which tokens are already recomputed.
+        """
+        threshold = getattr(
+            self._incremental_blend_strategy, "threshold", 0.01
+        )
+        N = int(blend_tokens.shape[0])
+        ctx_len = N - suffix_len
+        device = blend_tokens.device
+
+        # Edge: if no suffix or no context, skip scoring entirely.
+        if suffix_len <= 0 or ctx_len <= 0:
+            logger.info(
+                "[SAGE_MAGNET] request=%s pre-TTFT skip: suffix_len=%d ctx_len=%d",
+                req_id, suffix_len, ctx_len,
+            )
+            if state is not None:
+                state.decode_step = 0
+                state.query_token_count = suffix_len
+            self._sage_incremental_completed_requests.add(req_id)
+            return
+
+        # ── Pass 1: lightweight query-only scoring (ProphetKV Stage I) ──
+        query_tokens = blend_tokens[ctx_len:].to(device)
+        context_slot_mapping = blend_slot_mapping[:ctx_len]
+        fused_alpha = self.blender.layerwise_model.magnet_query_only_score(
+            query_token_ids=query_tokens,
+            context_slot_mapping=context_slot_mapping,
+            context_len=ctx_len,
+            query_position_start=ctx_len,
+            kvcaches=kvcaches,
+            gpu_connector=self.blender.gpu_connector,
+        )
+
+        selected: Optional[torch.Tensor] = None
+        # Apply candidate mask (first-chunk exclusion).
+        if (
+            sage_token_mask is not None
+            and sage_token_mask.numel() >= ctx_len
+        ):
+            ctx_mask = sage_token_mask[:ctx_len].to(device)
+            fused_alpha = fused_alpha.masked_fill(~ctx_mask, 0.0)
+
+        # Log quantile distribution for threshold tuning.
+        if fused_alpha.numel() > 0:
+            _fs, _ = torch.sort(fused_alpha, descending=True)
+            _n = _fs.numel()
+            _qs = [0.01, 0.05, 0.10, 0.20, 0.30, 0.50, 0.80]
+            _q_str = ", ".join(
+                f"top{int(q*100)}%≥{float(_fs[int(q*_n)].item()):.4f}"
+                for q in _qs
+            )
+            logger.info(
+                "[MAGNET_DIST] req=%s n=%d mean=%.4f max=%.4f min=%.4f "
+                "threshold=%.4f  %s",
+                req_id, _n, float(fused_alpha.mean().item()),
+                float(_fs[0].item()), float(_fs[-1].item()),
+                threshold, _q_str,
+            )
+            if os.environ.get("SAGE_MAGNET_DUMP_ALPHA", "0") == "1":
+                _dump_dir = os.environ.get(
+                    "SAGE_MAGNET_DUMP_DIR", "/tmp/magnet_alpha",
+                )
+                os.makedirs(_dump_dir, exist_ok=True)
+                torch.save({
+                    "alpha": fused_alpha.detach().cpu(),
+                    "req_id": req_id,
+                    "context_len": _n,
+                }, os.path.join(_dump_dir, f"{req_id}.pt"))
+
+        # Selection mode: "threshold" (ProphetKV-adaptive, fraction
+        # depends on context) or "topk" (fixed fraction, matches the
+        # CacheBlend paper and ProphetKV original exactly — importance
+        # still comes from magnet's fused_alpha).
+        _sel_mode = os.environ.get(
+            "SAGE_MAGNET_SELECTION_MODE", "threshold",
+        ).strip().lower()
+        if _sel_mode == "topk":
+            _topk_ratio = float(
+                os.environ.get("SAGE_MAGNET_TOPK_RATIO", "0.15")
+            )
+            _k = max(1, int(round(ctx_len * _topk_ratio)))
+            _k = min(_k, int(fused_alpha.numel()))
+            _topk_result = torch.topk(fused_alpha, k=_k)
+            _topk_idx = _topk_result.indices
+            _topk_vals = _topk_result.values
+            context_selected, _ = torch.sort(_topk_idx)
+            # Diagnostic: log top-10 selected indices and their α scores
+            # so we can correlate with the needle position.
+            _top10 = torch.topk(fused_alpha, k=min(10, int(fused_alpha.numel())))
+            _top10_idx = _top10.indices.cpu().tolist()
+            _top10_vals = [round(v, 4) for v in _top10.values.cpu().tolist()]
+            logger.info(
+                "[SAGE_MAGNET] selection_mode=topk k=%d ratio=%.4f "
+                "top10_idx=%s top10_alpha=%s ctx_len=%d",
+                _k, _topk_ratio, _top10_idx, _top10_vals, ctx_len,
+            )
+        else:
+            context_selected = torch.nonzero(
+                fused_alpha > threshold, as_tuple=False
+            ).flatten()
+            logger.info(
+                "[SAGE_MAGNET] selection_mode=threshold p=%.4f "
+                "selected=%d/%d",
+                threshold, int(context_selected.numel()), ctx_len,
+            )
+        suffix_indices = torch.arange(
+            ctx_len, N, device=device, dtype=torch.long,
+        )
+        selected = torch.cat([context_selected.to(torch.long), suffix_indices])
+        selected = torch.unique(selected, sorted=True)
+
+        selected_count = int(selected.numel()) if selected is not None else 0
+
+        # ── Pass 2: targeted recompute using pre-selected indices ──
+        if selected is not None and selected.numel() > 0:
+            self.blender.metadata.magnet_preselected_indices = selected.to(
+                device=device, dtype=torch.long,
+            )
+            try:
+                self.blender.blend_from_gpu(
+                    blend_tokens,
+                    sage_token_mask,
+                    step_recompute_ratio=None,
+                    capture_full_ranking=False,
+                    save_boundary=False,
+                    suffix_len=suffix_len,
+                    include_suffix=True,
+                    kvcaches=kvcaches,
+                    slot_mapping=blend_slot_mapping,
+                    block_table=blend_block_table,
+                    sage_zero_copy=sage_zero_copy,
+                )
+            finally:
+                self.blender.metadata.magnet_preselected_indices = None
+
+        if state is not None:
+            state.cumulative_ratio = float(selected_count) / max(1, N)
+            state.pre_ttft_recomputed_tokens = selected_count
+            state.decode_step = 0
+            state.query_token_count = suffix_len
+
+        imp_mean = (
+            float(fused_alpha.mean().item())
+            if fused_alpha is not None and fused_alpha.numel() > 0 else 0.0
+        )
+        imp_max = (
+            float(fused_alpha.max().item())
+            if fused_alpha is not None and fused_alpha.numel() > 0 else 0.0
+        )
+        logger.info(
+            "[SAGE_MAGNET] request=%s pre-TTFT complete (ProphetKV 2-pass): "
+            "N=%d suffix=%d selected=%d threshold=%.6f "
+            "mean_fused=%.6f max_fused=%.6f",
+            req_id, N, suffix_len, selected_count,
+            threshold, imp_mean, imp_max,
+        )
+
+        # Mark completed from the incremental-blend scheduler's perspective
+        # so it doesn't re-enter start_load_kv. Decode-time recomputation
+        # happens entirely via the hook + fused-inject pipeline, not via
+        # scheduler-triggered blend passes.
+        self._sage_incremental_completed_requests.add(req_id)
 
     def _run_layerwise_pre_ttft(
         self,
@@ -1112,13 +1380,14 @@ class LMCacheConnectorV1Impl:
 
         import time as _time
         _t_blend = _time.perf_counter()
+        _all_layers_pre_ttft = (pre_ttft_layers >= num_layers)
         self.blender.blend_from_gpu(
             blend_tokens,
             sage_token_mask,
             capture_full_ranking=True,
             save_boundary=True,
             suffix_len=suffix_len,
-            defer_suffix=True,  # Suffix recomputed on final incremental step
+            include_suffix=_all_layers_pre_ttft,
             kvcaches=kvcaches,
             slot_mapping=blend_slot_mapping,
             block_table=blend_block_table,
@@ -1172,12 +1441,406 @@ class LMCacheConnectorV1Impl:
             )
             state.layerwise_current_layer = pre_ttft_layers
             state.decode_step = max(state.decode_step, 1)
+            state.query_token_count = suffix_len
 
         logger.info(
             "[SAGE_LAYERWISE] request=%s pre-TTFT complete: "
             "N=%d M=%d pre_ttft_layers=%d/%d",
             req_id, N, M, pre_ttft_layers, num_layers,
         )
+
+    def sage_warmup_blender(self, device: Any, kvcaches: list) -> None:
+        """Pre-warm blender kernels with a tiny dummy blend.
+
+        Runs blend_from_gpu over a single block worth of dummy tokens
+        so that JIT compilation, cuBLAS handle creation, and the
+        torch caching allocator are all warmed up before the first
+        real request. The wall cost is paid once at engine init.
+        """
+        if not kvcaches or self.blender is None:
+            return
+        try:
+            block_size = self._block_size
+            N = block_size  # one block worth of tokens
+            dummy_tokens = torch.zeros(N, dtype=torch.long, device=device)
+            dummy_mask = torch.ones(N, dtype=torch.bool, device=device)
+            # Slot mapping into block 0 — this block is unused / about
+            # to be overwritten by real requests, so writing dummy KV
+            # into it is harmless and resets to zero before first use.
+            slot_mapping = torch.arange(N, dtype=torch.long, device=device)
+            block_table = torch.tensor(
+                [0], dtype=torch.long, device=device,
+            )
+            import time as _time
+            _t0 = _time.perf_counter()
+            try:
+                self._run_layerwise_pre_ttft(
+                    req_id="__sage_warmup__",
+                    blend_tokens=dummy_tokens,
+                    sage_token_mask=dummy_mask,
+                    blend_slot_mapping=slot_mapping,
+                    blend_block_table=block_table,
+                    kvcaches=kvcaches,
+                    sage_zero_copy=True,
+                    state=None,
+                    suffix_len=0,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[SAGE_WARMUP] blender warmup failed (non-fatal): %s",
+                    e,
+                )
+                return
+            logger.info(
+                "[SAGE_WARMUP] Blender pre-warmed in %.1fms",
+                (_time.perf_counter() - _t0) * 1000,
+            )
+        finally:
+            # Discard any state the dummy left behind on the blender so
+            # the first real request gets a clean start.
+            try:
+                self.blender._last_imp_indices = None
+                self.blender._scoring_boundary_hidden = None
+                self.blender._scoring_boundary_residual = None
+                self.blender._scoring_boundary_pos_to_row = None
+                self.blender._scoring_boundary_layer = None
+            except Exception:
+                pass
+
+    def sage_process_layer(
+        self,
+        parent_id: str,
+        layer_idx: int,
+        kvcaches: list,
+        slot_mapping: torch.Tensor,
+        token_ids: torch.Tensor,
+        token_mask: Optional[torch.Tensor] = None,
+        tokenwise_pre_ttft_ratio: Optional[float] = None,
+    ) -> bool:
+        """Process a single layer for pipelined recompute.
+
+        Handles ALL layer types:
+        - L0 (pre-check): N tokens, forward pass, no scoring
+        - L1 (check layer): N tokens, diff-k scoring, reduce to M
+        - L2+ (recompute): M tokens, forward pass, KV update
+
+        Stateless w.r.t. the blender — uses per-request state only,
+        so calls can be interleaved across requests.
+
+        Returns True if processing ran, False if skipped.
+        """
+        state = self._get_or_create_sage_incremental_state(parent_id)
+        if state is None:
+            return False
+
+        lmc_model = self.blender.layerwise_model
+        vllm_model = lmc_model.vllm_model
+        layers = vllm_model.model.layers
+        if layer_idx >= len(layers):
+            return False
+        layer = layers[layer_idx]
+
+        # Determine check layers and recompute ratio from blender config.
+        # For tokenwise, use the pre-TTFT ratio at the check layer
+        # (matching SG's _run_tokenwise_pre_ttft which passes
+        # step_recompute_ratio=pre_ttft_ratio to blend_from_gpu).
+        check_layers = self.blender.common_metadata.check_layers
+        recomp_ratio = (
+            self.blender.common_metadata.recomp_ratios[0]
+            if self.blender.common_metadata.recomp_ratios
+            else 0.15
+        )
+        if tokenwise_pre_ttft_ratio is not None and tokenwise_pre_ttft_ratio > 0:
+            recomp_ratio = tokenwise_pre_ttft_ratio
+        is_check_layer = layer_idx in check_layers
+        is_pre_check = layer_idx < min(check_layers)
+
+        # Get or initialize hidden states.
+        hidden = state.layerwise_saved_hidden
+        residual = state.layerwise_saved_residual
+
+        if layer_idx == 0:
+            # First layer: embed tokens.
+            hidden = vllm_model.embed_input_ids(token_ids.cuda())
+            residual = None
+            # Positions for all N tokens.
+            positions = torch.arange(
+                token_ids.shape[0], device=hidden.device, dtype=torch.long,
+            )
+            state._pipelined_positions = positions
+        elif hidden is None or residual is None:
+            logger.warning(
+                "[SAGE_PIPELINED] parent=%s L%d SKIP: hidden=%s residual=%s",
+                parent_id, layer_idx,
+                "None" if hidden is None else f"shape={list(hidden.shape)}",
+                "None" if residual is None else f"shape={list(residual.shape)}",
+            )
+            return False
+        else:
+            positions = state._pipelined_positions
+
+        # After check layer, only process M selected tokens.
+        selected = state.layerwise_selected_indices
+        if selected is not None and not is_pre_check and not is_check_layer:
+            positions = selected.to(device=hidden.device, dtype=torch.long)
+
+        num_kv_heads = lmc_model.vllm_attn_layers[layer_idx].num_kv_heads
+        num_heads = lmc_model.vllm_attn_layers[layer_idx].num_heads
+        head_size = lmc_model.vllm_attn_layers[layer_idx].head_size
+        N = int(positions.shape[0])
+
+        # Slot mapping for active tokens.
+        active_slots = slot_mapping[positions]
+
+        with torch.no_grad():
+            # === LayerNorm ===
+            if residual is None:
+                residual = hidden
+                hidden = layer.input_layernorm(hidden)
+            else:
+                hidden, residual = layer.input_layernorm(hidden, residual)
+
+            # === QKV projection ===
+            qkv, _ = layer.self_attn.qkv_proj(hidden)
+            q, k, v = qkv.split(
+                [
+                    layer.self_attn.q_size,
+                    layer.self_attn.kv_size,
+                    layer.self_attn.kv_size,
+                ],
+                dim=-1,
+            )
+            q, k, v = lmc_model._process_qkv(q, k, v, layer)
+
+            # === RoPE ===
+            q, k = layer.self_attn.rotary_emb(positions, q, k)
+
+            # === Diff-k scoring at check layer ===
+            if is_check_layer:
+                # Read old K from paged cache for comparison.
+                kv_cache = kvcaches[layer_idx]
+                _is_flash_ck = kv_cache.dim() >= 3 and kv_cache.shape[0] == 2
+                if _is_flash_ck:
+                    block_size = kv_cache.shape[2]
+                    blk_idx = active_slots // block_size
+                    blk_off = active_slots % block_size
+                    old_k = kv_cache[0, blk_idx, blk_off].view(N, -1)
+                elif kv_cache.dim() >= 4 and kv_cache.shape[1] == 2:
+                    block_size = kv_cache.shape[2]
+                    blk_idx = active_slots // block_size
+                    blk_off = active_slots % block_size
+                    old_k = kv_cache[blk_idx, 0, blk_off].view(N, -1)
+                else:
+                    block_size = kv_cache.shape[1]
+                    blk_idx = active_slots // block_size
+                    blk_off = active_slots % block_size
+                    old_k = kv_cache[blk_idx, blk_off, :num_kv_heads * head_size]
+
+                k_flat = k.view(N, -1)
+
+                # Compute suffix exclusion first (needed by debug hash).
+                _cached = self._sage_cached_prompt_inputs.get(parent_id, {})
+                suffix_len = min(
+                    int(_cached.get("query_token_count", 0) or 0),
+                    N,
+                )
+                non_suffix_len = N - suffix_len
+
+                _kf = k_flat[:non_suffix_len].float()
+                _ok = old_k[:non_suffix_len].float()
+                diff_k = torch.sum((_kf - _ok) ** 2, dim=[1])
+                # Build candidate mask excluding first chunk (causal LM
+                # optimization: first chunk has no left context, so its
+                # prefill KV is already correct). Uses masking to match
+                # SG's blend_from_gpu candidate_indices path exactly.
+                chunk_bounds = self._sage_cached_prompt_inputs.get(
+                    parent_id, {},
+                ).get("chunk_boundaries")
+                candidate_mask = torch.ones(
+                    non_suffix_len, dtype=torch.bool, device=diff_k.device,
+                )
+                if chunk_bounds and len(chunk_bounds) > 1 and chunk_bounds[0] == 0:
+                    first_chunk_end = min(chunk_bounds[1], non_suffix_len)
+                    candidate_mask[:first_chunk_end] = False
+                ns_candidates = torch.nonzero(
+                    candidate_mask, as_tuple=False,
+                ).flatten()
+
+                # Select top-M from candidates only (matching blend path).
+                topk_num = max(1, int(non_suffix_len * recomp_ratio))
+                effective_len = int(ns_candidates.numel())
+                topk_num = min(topk_num, effective_len)
+                if ns_candidates.numel() > 0:
+                    top_local = torch.topk(
+                        diff_k[ns_candidates], k=topk_num,
+                    ).indices
+                    top_indices = ns_candidates[top_local]
+                else:
+                    top_indices = torch.topk(diff_k, k=topk_num).indices
+
+                # Store full ranking for layerwise strategy (non-suffix only).
+                if ns_candidates.numel() > 0:
+                    score_view = diff_k[ns_candidates]
+                    ranked_local = torch.argsort(score_view, descending=True)
+                    full_ranking = ns_candidates[ranked_local]
+                else:
+                    full_ranking = torch.argsort(
+                        diff_k[:non_suffix_len], descending=True,
+                    )
+                state.layerwise_full_importance_ranking = full_ranking
+
+                # Append suffix when all layers are processed
+                # pre-TTFT (ptt=1.0 or sync cacheblend). For incremental
+                # (ptt<1.0), suffix is deferred to the final step.
+                _strategy_env = os.environ.get(
+                    "LMCACHE_BLEND_INCREMENTAL_STRATEGY", "layer_wise"
+                )
+                _all_layers_mg = (
+                    self._layerwise_pre_ttft_ratio >= 1.0
+                    or _strategy_env == "none"
+                )
+                if suffix_len > 0 and _all_layers_mg:
+                    suffix_indices = torch.arange(
+                        non_suffix_len, non_suffix_len + suffix_len,
+                        device=top_indices.device,
+                    )
+                    top_indices = torch.cat([top_indices, suffix_indices])
+                top_indices, _ = torch.sort(top_indices)
+
+                # Reduce to M tokens.
+                q = q[top_indices]
+                k = k[top_indices]
+                v = v[top_indices]
+                residual = residual[top_indices]
+                positions = positions[top_indices]
+                active_slots = slot_mapping[positions]
+                N = int(top_indices.shape[0])
+
+                state.layerwise_selected_indices = top_indices
+                state._pipelined_positions = positions
+                state.layerwise_diff_k_mean = float(diff_k.mean().item())
+                state.query_token_count = suffix_len
+                # Mark scoring as done so blend_from_gpu skips it
+                # when the parent enters the scheduler.
+                # Use class-level dict so SCHEDULER adapter can see it
+                # (MG has separate WORKER and SCHEDULER adapter instances).
+                state.early_blend_done = True
+                LMCacheConnectorV1Impl._shared_early_blend_done[parent_id] = True
+
+            # === Write new K,V to paged cache ===
+            # Pre-check layers (L0): skip write — blend_from_gpu writes
+            # original data back (no-op). Check layer (L1): skip write —
+            # the incremental decode path handles it. Recompute layers
+            # (L2+): write all M positions directly.
+            kv_cache = kvcaches[layer_idx]
+            k_for_cache = k.view(-1, num_kv_heads, head_size)
+            v_for_cache = v.view(-1, num_kv_heads, head_size)
+            _is_flash = kv_cache.dim() >= 3 and kv_cache.shape[0] == 2
+            if is_pre_check:
+                pass  # Don't write L0 — matches blend_from_gpu (no-op write)
+            elif _is_flash:
+                # Flash: [2, blocks, block_size, H, D]
+                block_size = kv_cache.shape[2]
+                blk_idx = active_slots // block_size
+                blk_off = active_slots % block_size
+                kv_cache[0, blk_idx, blk_off] = k_for_cache
+                kv_cache[1, blk_idx, blk_off] = v_for_cache
+            elif kv_cache.dim() >= 4 and kv_cache.shape[1] == 2:
+                # Triton: [blocks, 2, block_size, H, D]
+                block_size = kv_cache.shape[2]
+                blk_idx = active_slots // block_size
+                blk_off = active_slots % block_size
+                kv_cache[blk_idx, 0, blk_off] = k_for_cache
+                kv_cache[blk_idx, 1, blk_off] = v_for_cache
+            else:
+                # FlashInfer: [blocks, block_size, H, D]
+                block_size = kv_cache.shape[1]
+                blk_idx = active_slots // block_size
+                blk_off = active_slots % block_size
+                kv_cache[blk_idx, blk_off] = torch.cat(
+                    [k_for_cache, v_for_cache], dim=-1,
+                )
+
+            # === Attention ===
+            # Pre-check layers (L0): use fresh K,V (N×N self-attention).
+            # Check/recompute layers (L1+): M queries × N keys from paged
+            # cache, matching blend_from_gpu's M×N attention.
+            if is_pre_check:
+                # N×N with fresh K,V — same as compute_layer
+                q_attn = q.view(-1, num_heads, head_size)
+                k_attn = k.view(-1, num_kv_heads, head_size)
+                v_attn = v.view(-1, num_kv_heads, head_size)
+                attn_metadata = lmc_model.lmc_attn_layers[layer_idx].init_attn_metadata(
+                    input_ids=positions,
+                )
+                attn_output = torch.empty(
+                    N, num_heads, head_size, dtype=q.dtype, device=q.device,
+                )
+                attn_output = lmc_model.lmc_attn_layers[layer_idx].forward_contiguous(
+                    q_attn, k_attn, v_attn, attn_output, attn_metadata,
+                )
+            else:
+                # M×N: read full context K,V from paged cache
+                _total_N = int(token_ids.shape[0])
+                _all_slots = slot_mapping[:_total_N]
+                kv_cache_attn = kvcaches[layer_idx]
+                _is_flash_a = kv_cache_attn.dim() >= 3 and kv_cache_attn.shape[0] == 2
+                if _is_flash_a:
+                    _bs = kv_cache_attn.shape[2]
+                    _bi = _all_slots // _bs
+                    _bo = _all_slots % _bs
+                    full_k = kv_cache_attn[0, _bi, _bo].view(_total_N, num_kv_heads, head_size)
+                    full_v = kv_cache_attn[1, _bi, _bo].view(_total_N, num_kv_heads, head_size)
+                elif kv_cache_attn.dim() >= 4 and kv_cache_attn.shape[1] == 2:
+                    _bs = kv_cache_attn.shape[2]
+                    _bi = _all_slots // _bs
+                    _bo = _all_slots % _bs
+                    full_k = kv_cache_attn[_bi, 0, _bo].view(_total_N, num_kv_heads, head_size)
+                    full_v = kv_cache_attn[_bi, 1, _bo].view(_total_N, num_kv_heads, head_size)
+                else:
+                    _bs = kv_cache_attn.shape[1]
+                    _bi = _all_slots // _bs
+                    _bo = _all_slots % _bs
+                    _kv = kv_cache_attn[_bi, _bo]
+                    full_k = _kv[..., :num_kv_heads * head_size].view(_total_N, num_kv_heads, head_size)
+                    full_v = _kv[..., num_kv_heads * head_size:].view(_total_N, num_kv_heads, head_size)
+
+                q = q.view(-1, num_heads, head_size)
+                attn_metadata = lmc_model.lmc_attn_layers[layer_idx].init_attn_metadata(
+                    input_ids=torch.arange(_total_N, device=q.device),
+                    num_queries=N,
+                )
+                attn_output = torch.empty(
+                    N, num_heads, head_size, dtype=q.dtype, device=q.device,
+                )
+                attn_output = lmc_model.lmc_attn_layers[layer_idx].forward_contiguous(
+                    q, full_k, full_v, attn_output, attn_metadata,
+                )
+
+            # === O projection + FFN ===
+            attn_output = attn_output.view(-1, num_heads * head_size)
+            hidden, _ = layer.self_attn.o_proj(attn_output)
+            if hasattr(layer, "pre_feedforward_layernorm"):
+                # Gemma 3: 4-norm structure
+                hidden = layer.post_attention_layernorm(hidden)
+                hidden, residual = layer.pre_feedforward_layernorm(
+                    hidden, residual,
+                )
+                hidden = layer.mlp(hidden)
+                hidden = layer.post_feedforward_layernorm(hidden)
+            else:
+                # Llama/Qwen: 2-norm structure
+                hidden, residual = layer.post_attention_layernorm(
+                    hidden, residual,
+                )
+                hidden = layer.mlp(hidden)
+
+        # Save state for next layer.
+        state.layerwise_saved_hidden = hidden.detach()
+        state.layerwise_saved_residual = residual.detach()
+        state.layerwise_current_layer = layer_idx + 1
+
+        return True
 
     def _get_or_create_cached_prompt_inputs(
         self,
@@ -1376,22 +2039,75 @@ class LMCacheConnectorV1Impl:
                             assert _chunk_bounds is not None and len(_chunk_bounds) >= 2, (
                                 f"SAGE request {request.req_id} missing chunk_boundaries"
                             )
-                            import time as _time
-                            _t_rope = _time.perf_counter()
-                            self._run_rope_prepass_and_remap(
-                                request.req_id,
-                                chunk_boundaries=_chunk_bounds,
-                                slot_mapping=slot_mapping,
-                                num_tokens=int(lmcache_cached_tokens),
-                                block_table=_extract_block_table_from_attn_metadata(attn_metadata),
-                                block_table_idx=idx,
-                                kvcaches=kvcaches,
+                            # Use the full allocated block list (may exceed
+                            # ceil(N/block_size) when SAGE zero-copy chunks
+                            # contribute partial-last-block extras). Falling
+                            # back to slot_mapping-striding would drop the
+                            # virtual-only blocks and break the remap math.
+                            _req_block_ids = getattr(
+                                request, "allocated_block_ids", None
                             )
-                            logger.info(
-                                "[SAGE_TIMING] rope_prepass elapsed=%.3fms",
-                                (_time.perf_counter() - _t_rope) * 1000,
+                            # Contiguous-order block list (slot_mapping-derived):
+                            # may MISS virtual-only blocks (partial-last-block
+                            # extras from SAGE chunked prefill).
+                            _rope_block_table_from_sm = (
+                                slot_mapping[:lmcache_cached_tokens:self._block_size]
+                                // self._block_size
+                            ).clone().to(dtype=torch.long)
+                            if _req_block_ids is not None:
+                                _rope_block_table = _req_block_ids.to(
+                                    device=self.device, dtype=torch.long,
+                                ).contiguous()
+                            else:
+                                _rope_block_table = _rope_block_table_from_sm
+                            # If pipelined recompute already did partial
+                            # RoPE+remap, skip those layers.
+                            _partial_done = None
+                            _state_check = self._sage_incremental_states.get(
+                                request.req_id
                             )
-
+                            if _state_check is not None:
+                                _partial_done = getattr(
+                                    _state_check, "layerwise_current_layer", 0
+                                ) or None
+                            _layer_range = None
+                            if _partial_done is not None and _partial_done > 0:
+                                if _partial_done >= len(kvcaches):
+                                    # All layers already processed.
+                                    logger.info(
+                                        "[SAGE_TIMING] rope_prepass skipped "
+                                        "(all %d layers done by pipelined recompute)",
+                                        len(kvcaches),
+                                    )
+                                    self._sage_rope_adjusted_requests.add(
+                                        request.req_id
+                                    )
+                                    # Skip to blend logic below.
+                                    _already_adj = True
+                                else:
+                                    _layer_range = (_partial_done, len(kvcaches))
+                                    logger.info(
+                                        "[SAGE_TIMING] rope_prepass skipping "
+                                        "L0..%d, processing L%d..%d",
+                                        _partial_done - 1, _partial_done,
+                                        len(kvcaches) - 1,
+                                    )
+                            if not _already_adj:
+                                self._run_rope_prepass_and_remap(
+                                    request.req_id,
+                                    chunk_boundaries=_chunk_bounds,
+                                    slot_mapping=slot_mapping,
+                                    num_tokens=int(lmcache_cached_tokens),
+                                    rope_block_table=_rope_block_table,
+                                    kvcaches=kvcaches,
+                                    layer_range=_layer_range,
+                                )
+                                # If we did a partial pass (remaining layers
+                                # after early-blend), mark as fully adjusted.
+                                if _layer_range is not None:
+                                    self._sage_rope_adjusted_requests.add(
+                                        request.req_id
+                                    )
                         strategy = getattr(self, "_incremental_blend_strategy", None)
                         if (
                             strategy is not None
@@ -1424,10 +2140,52 @@ class LMCacheConnectorV1Impl:
                                 should_blend_this_step,
                             )
 
+                            # ── Tokenwise MG: wire ranking from sage_process_layer ──
+                            # sage_process_layer (MG drain) may have scored + recomputed
+                            # all layers. Detect this via early_blend_done and set up
+                            # the frozen ranking for decode-step scheduling. This check
+                            # runs regardless of is_pre_ttft_step because in MG the
+                            # suffix prefill may have already incremented num_output_tokens.
+                            _eb_tw_early = (
+                                self._sage_method == SageMethod.CACHEBLEND_TOKENWISE
+                                and getattr(state, "early_blend_done", False)
+                                and getattr(state, "frozen_importance_ranking", None) is None
+                                and should_blend_this_step
+                            )
+                            if _eb_tw_early:
+                                _full_rank = getattr(state, "layerwise_full_importance_ranking", None)
+                                if _full_rank is not None and _full_rank.numel() > 0:
+                                    _tw_ptt = self._tokenwise_pre_ttft_ratio
+                                    N_tw = int(lmcache_cached_tokens)
+                                    _pre_ttft_count = max(1, int(N_tw * _tw_ptt))
+                                    _remaining = _full_rank[_pre_ttft_count:]
+                                    if _remaining.numel() > 0:
+                                        state.frozen_importance_ranking = _remaining
+                                        state.frozen_ratio_cursor = 0.0
+                                        state.cumulative_ratio = float(_tw_ptt)
+                                        state.pre_ttft_recomputed_tokens = _pre_ttft_count
+                                        state.decode_step = max(state.decode_step, 1)
+                                        state._tw_cursor = 0
+                                        state._tw_tokens_emitted = 0
+                                        state._tw_prev_ratio = float(_tw_ptt)
+                                    else:
+                                        self._mark_sage_recompute_completed(
+                                            request.req_id, state, _tw_ptt,
+                                        )
+                                        should_blend_this_step = False
+                                    logger.info(
+                                        "[SAGE_PATH] request=%s → tokenwise_early_blend "
+                                        "ranking=%d remaining=%d ptt=%.2f",
+                                        request.req_id,
+                                        int(_full_rank.numel()),
+                                        int(_remaining.numel()) if _remaining.numel() > 0 else 0,
+                                        _tw_ptt,
+                                    )
+                                    # Hash pre-TTFT state for tokenwise (MG)
                             # ── Layer-wise incremental scheduling ──
                             # Deferred diff-k: run scoring in decode step 1 instead of pre-TTFT.
                             if not should_blend_this_step:
-                                pass  # incremental budget exhausted
+                                pass  # Hash handled by universal check below
                             elif (
                                 self._sage_method == SageMethod.CACHEBLEND_LAYERWISE
                                 and self._layerwise_defer_diff_k
@@ -1451,7 +2209,43 @@ class LMCacheConnectorV1Impl:
                                     state=state,
                                     suffix_len=request.query_token_count,
                                 )
-                                should_blend_this_step = False  # scoring done; recompute starts next step
+                                # Immediately set up first injection in the same
+                                # step (same fix as the immediate pre-TTFT path).
+                                if (
+                                    state.layerwise_selected_indices is not None
+                                    and state.layerwise_saved_hidden is not None
+                                ):
+                                    _first_step = strategy.next_step(
+                                        state, self.blender.num_layers
+                                    )
+                                    if _first_step.should_blend and _first_step.layer_range is not None:
+                                        _lw_s, _lw_e = _first_step.layer_range
+                                        _sel = state.layerwise_selected_indices
+                                        _cp = self._get_or_create_cached_prompt_inputs(
+                                            req_id=request.req_id,
+                                            tokens=tokens,
+                                            prompt_len=int(lmcache_cached_tokens),
+                                            slot_mapping=slot_mapping,
+                                        )
+                                        self._fused_inject_pending[request.req_id] = {
+                                            "token_ids": _cp["prompt_tokens"][_sel],
+                                            "positions": _sel.clone(),
+                                            "slots": _cp["prompt_slot_mapping"][_sel],
+                                            "hidden_states": state.layerwise_saved_hidden,
+                                            "residual": state.layerwise_saved_residual,
+                                            "inject_layer": _lw_s,
+                                            "extract_layer": _lw_e,
+                                        }
+                                        self._sage_pending_blend_launch_t0[
+                                            request.req_id
+                                        ] = time.perf_counter()
+                                        logger.info(
+                                            "[SAGE_LAYERWISE] request=%s "
+                                            "deferred_scoring+inject layers=[%d,%d) M=%d",
+                                            request.req_id, _lw_s, _lw_e,
+                                            int(_sel.numel()),
+                                        )
+                                should_blend_this_step = False
                             elif (
                                 self._sage_method == SageMethod.CACHEBLEND_LAYERWISE
                                 and incremental_active
@@ -1499,12 +2293,15 @@ class LMCacheConnectorV1Impl:
                                     should_blend_this_step = False
                                     logger.info(
                                         "[SAGE_LAYERWISE] request=%s decode_step=%d "
-                                        "staged injection layers=[%d,%d) M=%d",
+                                        "staged injection layers=[%d,%d) M=%d "
+                                        "num_output_tokens=%d lmcache_cached=%d",
                                         request.req_id,
                                         state.decode_step,
                                         lw_start,
                                         lw_end,
                                         int(selected_indices.numel()),
+                                        request.num_output_tokens,
+                                        int(lmcache_cached_tokens),
                                     )
                                 elif not step.should_blend:
                                     should_blend_this_step = False
@@ -1522,34 +2319,193 @@ class LMCacheConnectorV1Impl:
                                         state.layerwise_current_layer,
                                         self.blender.num_layers,
                                     )
+                                    # Re-recompute suffix after all
+                                    # incremental layers are done. The
+                                    # suffix was prefilled pre-TTFT with
+                                    # stale KV at unrecomputed layers.
+                                    # Skip if suffix was already included
+                                    # in the pre-TTFT recompute (ptt=1.0).
+                                    _qtc_raw = getattr(
+                                        state, "query_token_count",
+                                        getattr(
+                                            request, "query_token_count", 0
+                                        ),
+                                    )
+                                    _suffix_len_final = min(
+                                        int(_qtc_raw or 0),
+                                        int(lmcache_cached_tokens),
+                                    )
+                                    _pre_ttft_layers = max(
+                                        2,
+                                        int(
+                                            self.blender.num_layers
+                                            * self._layerwise_pre_ttft_ratio
+                                        ),
+                                    )
+                                    _already_included = (
+                                        _pre_ttft_layers
+                                        >= self.blender.num_layers
+                                    )
+                                    logger.info(
+                                        "[SAGE_SUFFIX_CHECK] req=%s "
+                                        "qtc_raw=%s suffix_len=%d "
+                                        "pre_ttft_layers=%d "
+                                        "already_included=%s",
+                                        request.req_id,
+                                        _qtc_raw,
+                                        _suffix_len_final,
+                                        _pre_ttft_layers,
+                                        _already_included,
+                                    )
+                                    if (
+                                        _suffix_len_final > 0
+                                        and not _already_included
+                                    ):
+                                        _non_suffix_final = int(
+                                            lmcache_cached_tokens
+                                        ) - _suffix_len_final
+                                        _suffix_pos = torch.arange(
+                                            _non_suffix_final,
+                                            int(lmcache_cached_tokens),
+                                            device=self.device,
+                                            dtype=torch.long,
+                                        )
+                                        _cp_final = (
+                                            self._get_or_create_cached_prompt_inputs(
+                                                req_id=request.req_id,
+                                                tokens=tokens,
+                                                prompt_len=int(
+                                                    lmcache_cached_tokens
+                                                ),
+                                                slot_mapping=slot_mapping,
+                                            )
+                                        )
+                                        _suffix_tids = _cp_final[
+                                            "prompt_tokens"
+                                        ][_suffix_pos]
+                                        _suffix_emb = (
+                                            self.blender.layerwise_model
+                                            .vllm_model.embed_input_ids(
+                                                _suffix_tids.to(self.device)
+                                            )
+                                        )
+                                        self._fused_inject_pending[
+                                            request.req_id
+                                        ] = {
+                                            "token_ids": _suffix_tids,
+                                            "positions": _suffix_pos.clone(),
+                                            "slots": _cp_final[
+                                                "prompt_slot_mapping"
+                                            ][_suffix_pos],
+                                            "hidden_states": _suffix_emb,
+                                            "residual": None,
+                                            "inject_layer": 0,
+                                            "extract_layer": (
+                                                self.blender.num_layers
+                                            ),
+                                        }
+                                        self._sage_suffix_rerecompute_pending.add(
+                                            request.req_id
+                                        )
+                                        logger.info(
+                                            "[SAGE_SUFFIX_RERECOMPUTE] "
+                                            "req=%s suffix=%d inject=[0,%d)",
+                                            request.req_id,
+                                            _suffix_len_final,
+                                            self.blender.num_layers,
+                                        )
                             elif (
                                 self._sage_method == SageMethod.CACHEBLEND_TOKENWISE
                                 and not is_pre_ttft_step
                             ):
                                 if state.frozen_importance_ranking is None:
-                                    # Scoring not done — should not happen
-                                    # (pre-TTFT always scores).
-                                    should_blend_this_step = False
-                                    self._sage_incremental_completed_requests.add(
+                                    if request.req_id in self._sage_suffix_rerecompute_pending:
+                                        # Suffix rerecompute is in flight — don't
+                                        # re-enter tokenwise scheduling. The fused
+                                        # inject lifecycle will handle completion.
+                                        should_blend_this_step = False
+                                    elif (
                                         request.req_id
-                                    )
-                                    logger.error(
-                                        "[SAGE_PATH] request=%s → SCHED:tokenwise_missing_ranking "
-                                        "(BUG: pre-TTFT scoring should have set this)",
-                                        request.req_id,
-                                    )
-                                else:
-                                    step = strategy.next_step(state, self.blender.num_layers)
-                                    if not step.should_blend:
-                                        # Budget exhausted.
+                                        in self._sage_incremental_completed_requests
+                                    ):
+                                        # Already completed (suffix rerecomp done).
+                                        should_blend_this_step = False
+                                    else:
+                                        # Scoring not done — should not happen
+                                        # (pre-TTFT always scores).
                                         should_blend_this_step = False
                                         self._sage_incremental_completed_requests.add(
                                             request.req_id
                                         )
-                                        state.frozen_importance_ranking = None
-                                        logger.info(
-                                            "[SAGE_PATH] request=%s → SCHED:tokenwise_completed",
+                                        logger.error(
+                                            "[SAGE_PATH] request=%s → SCHED:tokenwise_missing_ranking "
+                                            "(BUG: pre-TTFT scoring should have set this)",
                                             request.req_id,
+                                        )
+                                else:
+                                    step = strategy.next_step(state, self.blender.num_layers)
+                                    if not step.should_blend:
+                                        # Budget exhausted — check if suffix
+                                        # needs rerecompute (same as layerwise).
+                                        state.frozen_importance_ranking = None
+                                        _suffix_n_tw = int(getattr(
+                                            state, "query_token_count",
+                                            getattr(request, "query_token_count", 0),
+                                        ) or 0)
+                                        _tw_ptt_check = self._tokenwise_pre_ttft_ratio
+                                        _tw_suffix_already = (_tw_ptt_check >= 1.0)
+                                        if (
+                                            _suffix_n_tw > 0
+                                            and not _tw_suffix_already
+                                            and request.req_id
+                                            not in self._sage_suffix_rerecompute_pending
+                                        ):
+                                            _N_tw_final = int(lmcache_cached_tokens)
+                                            _non_suffix_tw = _N_tw_final - _suffix_n_tw
+                                            _suffix_pos_tw = torch.arange(
+                                                _non_suffix_tw, _N_tw_final,
+                                                device=self.device, dtype=torch.long,
+                                            )
+                                            _cp_tw = self._get_or_create_cached_prompt_inputs(
+                                                req_id=request.req_id,
+                                                tokens=tokens,
+                                                prompt_len=_N_tw_final,
+                                                slot_mapping=slot_mapping,
+                                            )
+                                            _suffix_tids_tw = _cp_tw["prompt_tokens"][_suffix_pos_tw]
+                                            _suffix_emb_tw = (
+                                                self.blender.layerwise_model
+                                                .vllm_model.embed_input_ids(
+                                                    _suffix_tids_tw.to(self.device)
+                                                )
+                                            )
+                                            self._fused_inject_pending[request.req_id] = {
+                                                "token_ids": _suffix_tids_tw,
+                                                "positions": _suffix_pos_tw.clone(),
+                                                "slots": _cp_tw["prompt_slot_mapping"][_suffix_pos_tw],
+                                                "hidden_states": _suffix_emb_tw,
+                                                "residual": None,
+                                                "inject_layer": 0,
+                                                "extract_layer": self.blender.num_layers,
+                                            }
+                                            self._sage_suffix_rerecompute_pending.add(request.req_id)
+                                            should_blend_this_step = True
+                                            logger.info(
+                                                "[SAGE_SUFFIX_RERECOMPUTE] req=%s "
+                                                "suffix=%d inject=[0,%d) (tokenwise)",
+                                                request.req_id, _suffix_n_tw,
+                                                self.blender.num_layers,
+                                            )
+                                        else:
+                                            should_blend_this_step = False
+                                            self._sage_incremental_completed_requests.add(
+                                                request.req_id
+                                            )
+                                        logger.info(
+                                            "[SAGE_PATH] request=%s → SCHED:tokenwise_completed "
+                                            "suffix_rerecomp=%s",
+                                            request.req_id,
+                                            request.req_id in self._sage_suffix_rerecompute_pending,
                                         )
                                     else:
                                         logger.info(
@@ -1561,53 +2517,42 @@ class LMCacheConnectorV1Impl:
                                         ranking = state.frozen_importance_ranking
                                         total_ranked = int(ranking.numel())
                                         N = int(max(1, lmcache_cached_tokens))
-                                        _pre_ttft = int(
-                                            getattr(state, "pre_ttft_recomputed_tokens", 0)
-                                        )
-                                        start_idx = min(
-                                            int(total_ranked * state.frozen_ratio_cursor),
-                                            total_ranked,
-                                        )
-                                        target_tokens = int(
-                                            float(step.recompute_ratio) * float(N)
-                                        ) - _pre_ttft
-                                        end_idx = min(total_ranked, max(start_idx, target_tokens))
+
+                                        # Fixed tokens per step: use the step
+                                        # delta from the strategy (default 5% of N).
+                                        _prev_ratio = getattr(state, "_tw_prev_ratio", 0.0)
+                                        _step_delta = step.recompute_ratio - _prev_ratio
+                                        _tokens_per_step = max(1, int(_step_delta * N))
+                                        state._tw_prev_ratio = step.recompute_ratio
+                                        # Use cursor to track position in ranking
+                                        start_idx = int(getattr(state, "_tw_cursor", 0))
+                                        end_idx = min(total_ranked, start_idx + _tokens_per_step)
 
                                         if end_idx <= start_idx:
                                             should_blend_this_step = False
                                         else:
                                             precomputed_imp_indices = ranking[start_idx:end_idx]
-                                            # On the last slice, append suffix indices
-                                            # so suffix is recomputed with fully-corrected context.
-                                            _suffix_n = request.query_token_count
-                                            if end_idx >= total_ranked and _suffix_n > 0:
-                                                _non_suffix = N - _suffix_n
-                                                _suffix_idx = torch.arange(
-                                                    _non_suffix, N,
-                                                    device=precomputed_imp_indices.device,
-                                                )
-                                                precomputed_imp_indices = torch.cat([
-                                                    precomputed_imp_indices, _suffix_idx,
-                                                ])
-                                                logger.info(
-                                                    "[SAGE_INCREMENTAL] request=%s appending "
-                                                    "%d suffix tokens to final step",
-                                                    request.req_id, _suffix_n,
-                                                )
                                             should_blend_this_step = True
-                                            state.frozen_ratio_cursor = float(end_idx) / float(
-                                                max(1, total_ranked)
+                                            state._tw_cursor = end_idx
+                                            state._tw_tokens_emitted = int(
+                                                getattr(state, "_tw_tokens_emitted", 0)
+                                            ) + (end_idx - start_idx)
+                                            step_recompute_ratio = (
+                                                float(end_idx) / float(max(1, total_ranked))
                                             )
-                                            step_recompute_ratio = float(end_idx) / float(N)
                                             state.cumulative_ratio = max(
-                                                state.cumulative_ratio, step_recompute_ratio,
+                                                state.cumulative_ratio,
+                                                float(
+                                                    int(getattr(state, "pre_ttft_recomputed_tokens", 0))
+                                                    + end_idx
+                                                ) / float(N),
                                             )
                                             logger.info(
-                                                "[SAGE_INCREMENTAL] request=%s static slice "
-                                                "[%d:%d) of %d (cursor=%.4f decode_step=%d)",
+                                                "[SAGE_INCREMENTAL] request=%s tokenwise slice "
+                                                "[%d:%d) of %d M=%d decode_step=%d",
                                                 request.req_id,
                                                 start_idx, end_idx, total_ranked,
-                                                state.frozen_ratio_cursor,
+                                                end_idx - start_idx,
                                                 state.decode_step,
                                             )
                         if should_blend_this_step:
@@ -1642,13 +2587,20 @@ class LMCacheConnectorV1Impl:
                             # After RoPE prepass + remap, all KV is at
                             # contiguous slots. No virtual/contiguous split.
                             blend_slot_mapping = slot_mapping[:lmcache_cached_tokens]
-                            _bt = _extract_block_table_from_attn_metadata(
-                                attn_metadata
-                            )
+                            # Build the per-request block_table directly
+                            # from the request's slot_mapping. Each block
+                            # contributes block_size consecutive slots,
+                            # so the block_id at position i*block_size in
+                            # slot_mapping is `slot // block_size`. Using
+                            # `attn_metadata.block_table[idx]` is wrong
+                            # here because `idx` is the LMCache loop
+                            # index (per metadata.requests), not the
+                            # input_batch row index — they may differ
+                            # when multiple requests share an engine.
                             blend_block_table = (
-                                _bt[idx].clone() if _bt is not None
-                                and idx < _bt.shape[0] else None
-                            )
+                                slot_mapping[:lmcache_cached_tokens:self._block_size]
+                                // self._block_size
+                            ).clone().to(dtype=torch.long)
                             # Stage-II token-wise optimization: run blending on selected
                             # token slice only (instead of full prompt range).
                             has_precomputed_indices = (
@@ -1672,29 +2624,62 @@ class LMCacheConnectorV1Impl:
                                 prompt_tokens = cached_prompt["prompt_tokens"]
                                 prompt_slot_mapping = cached_prompt["prompt_slot_mapping"]
 
-                                # Tokenwise injection: build payload for
-                                # inject_fused_recompute_tokens.
+                                # Tokenwise injection: each decode-step
+                                # batch processes DIFFERENT tokens through
+                                # ALL layers (L0-L35). Start from embeddings
+                                # at L0 (these tokens haven't been processed
+                                # at any layer yet). Extract at the last
+                                # layer so the inject rows are removed after
+                                # the forward completes.
                                 if self._sage_method == SageMethod.CACHEBLEND_TOKENWISE:
+                                    _tw_tids = prompt_tokens[precomputed_imp_indices]
+                                    _tw_emb = (
+                                        self.blender.layerwise_model
+                                        .vllm_model.embed_input_ids(
+                                            _tw_tids.to(self.device)
+                                        )
+                                    )
                                     payload = {
-                                        "token_ids": prompt_tokens[precomputed_imp_indices],
+                                        "token_ids": _tw_tids,
                                         "positions": precomputed_imp_indices.clone(),
                                         "slots": prompt_slot_mapping[precomputed_imp_indices],
+                                        "hidden_states": _tw_emb,
+                                        "residual": None,
+                                        "inject_layer": 0,
+                                        "extract_layer": self.blender.num_layers,
                                     }
-                                    # If scoring saved boundary hidden states,
-                                    # include them so injection skips layers 0-1.
-                                    _bnd_h = self.blender._scoring_boundary_hidden
-                                    _bnd_r = self.blender._scoring_boundary_residual
-                                    _bnd_l = self.blender._scoring_boundary_layer
-                                    _p2r = self.blender._scoring_boundary_pos_to_row
-                                    if _bnd_h is not None and _p2r is not None:
-                                        _rows = _p2r[precomputed_imp_indices]
-                                        payload["hidden_states"] = _bnd_h[_rows].clone()
-                                        payload["residual"] = _bnd_r[_rows].clone()
-                                        payload["inject_layer"] = _bnd_l
                                     self._fused_inject_pending[request.req_id] = payload
                                     self._sage_pending_blend_launch_t0[request.req_id] = time.perf_counter()
                             if request.req_id not in self._fused_inject_pending:
-                                if (
+                                # If sage_process_layer already scored (MG path),
+                                # skip pre-TTFT entirely — scoring + indices are
+                                # already on state, and the layerwise strategy will
+                                # pick up from layerwise_current_layer.
+                                logger.info(
+                                    "[SAGE_PRE_TTFT_STATE] req=%s early_blend=%s "
+                                    "selected=%s current_layer=%d state_id=%d",
+                                    request.req_id,
+                                    getattr(state, "early_blend_done", "MISSING"),
+                                    state.layerwise_selected_indices is not None
+                                    if state is not None else "no_state",
+                                    getattr(state, "layerwise_current_layer", -1),
+                                    id(state),
+                                )
+                                _eb_lw = (
+                                    getattr(state, "early_blend_done", False)
+                                    or LMCacheConnectorV1Impl._shared_early_blend_done.get(
+                                        request.req_id, False
+                                    )
+                                )
+                                if _eb_lw:
+                                    logger.info(
+                                        "[SAGE_PATH] request=%s → EXEC:layerwise_pre_ttft_skipped "
+                                        "(early, selected=%s current_layer=%d)",
+                                        request.req_id,
+                                        getattr(state, "layerwise_selected_indices", None) is not None,
+                                        getattr(state, "layerwise_current_layer", 0),
+                                    )
+                                elif (
                                     self._sage_method == SageMethod.CACHEBLEND_LAYERWISE
                                     and state.layerwise_selected_indices is None
                                 ):
@@ -1718,6 +2703,16 @@ class LMCacheConnectorV1Impl:
                                             int(blend_tokens.shape[0]),
                                         )
                                     else:
+                                        # SG path: run layerwise pre-TTFT blend.
+                                        # MG path should never reach here — caught
+                                        # by _shared_early_blend_done check above.
+                                        assert not LMCacheConnectorV1Impl._shared_early_blend_done.get(
+                                            request.req_id, False
+                                        ), (
+                                            f"Double processing: sage_process_layer already "
+                                            f"blended {request.req_id} but layerwise "
+                                            f"pre-TTFT is about to run again"
+                                        )
                                         logger.info(
                                             "[SAGE_PATH] request=%s → EXEC:layerwise_pre_ttft_immediate",
                                             request.req_id,
@@ -1733,34 +2728,125 @@ class LMCacheConnectorV1Impl:
                                             state=state,
                                             suffix_len=request.query_token_count,
                                         )
+                                        # Immediately set up first injection in the same
+                                        # step so it piggybacks on the first decode token's
+                                        # forward — avoids wasting a decode step before
+                                        # the first injection (matching MG behavior).
+                                        if (
+                                            state.layerwise_selected_indices is not None
+                                            and state.layerwise_saved_hidden is not None
+                                        ):
+                                            _first_step = strategy.next_step(
+                                                state, self.blender.num_layers
+                                            )
+                                            if _first_step.should_blend and _first_step.layer_range is not None:
+                                                _lw_s, _lw_e = _first_step.layer_range
+                                                _sel = state.layerwise_selected_indices
+                                                _cp = self._get_or_create_cached_prompt_inputs(
+                                                    req_id=request.req_id,
+                                                    tokens=tokens,
+                                                    prompt_len=int(lmcache_cached_tokens),
+                                                    slot_mapping=slot_mapping,
+                                                )
+                                                self._fused_inject_pending[request.req_id] = {
+                                                    "token_ids": _cp["prompt_tokens"][_sel],
+                                                    "positions": _sel.clone(),
+                                                    "slots": _cp["prompt_slot_mapping"][_sel],
+                                                    "hidden_states": state.layerwise_saved_hidden,
+                                                    "residual": state.layerwise_saved_residual,
+                                                    "inject_layer": _lw_s,
+                                                    "extract_layer": _lw_e,
+                                                }
+                                                self._sage_pending_blend_launch_t0[
+                                                    request.req_id
+                                                ] = time.perf_counter()
+                                                should_blend_this_step = False
+                                                logger.info(
+                                                    "[SAGE_LAYERWISE] request=%s "
+                                                    "pre_ttft+inject layers=[%d,%d) M=%d",
+                                                    request.req_id, _lw_s, _lw_e,
+                                                    int(_sel.numel()),
+                                                )
                                 elif (
                                     self._sage_method == SageMethod.CACHEBLEND_TOKENWISE
                                     and is_pre_ttft_step
                                 ):
-                                    logger.info(
-                                        "[SAGE_PATH] request=%s → EXEC:tokenwise_pre_ttft_scoring",
-                                        request.req_id,
-                                    )
-                                    logger.info(
-                                        "[SAGE_TOKENWISE_SCORING] request=%s "
-                                        "N=%d candidates=%d pre_ttft_ratio=%.4f",
-                                        request.req_id,
-                                        int(blend_tokens.shape[0]),
-                                        int(sage_token_mask.sum().item()),
-                                        self._tokenwise_pre_ttft_ratio,
-                                    )
-                                    self._run_tokenwise_pre_ttft(
-                                        req_id=request.req_id,
-                                        blend_tokens=blend_tokens,
-                                        sage_token_mask=sage_token_mask,
-                                        blend_slot_mapping=blend_slot_mapping,
-                                        blend_block_table=blend_block_table,
-                                        kvcaches=kvcaches,
-                                        sage_zero_copy=request.sage_blocks_transferred,
-                                        state=state,
-                                        suffix_len=request.query_token_count,
-                                    )
+                                        # SG path: run tokenwise pre-TTFT.
+                                        # MG path should never reach here.
+                                        assert not LMCacheConnectorV1Impl._shared_early_blend_done.get(
+                                            request.req_id, False
+                                        ), (
+                                            f"Double processing: sage_process_layer already "
+                                            f"blended {request.req_id} but tokenwise "
+                                            f"pre-TTFT is about to run again"
+                                        )
+                                        logger.info(
+                                            "[SAGE_PATH] request=%s → EXEC:tokenwise_pre_ttft_scoring",
+                                            request.req_id,
+                                        )
+                                        self._run_tokenwise_pre_ttft(
+                                            req_id=request.req_id,
+                                            blend_tokens=blend_tokens,
+                                            sage_token_mask=sage_token_mask,
+                                            blend_slot_mapping=blend_slot_mapping,
+                                            blend_block_table=blend_block_table,
+                                            kvcaches=kvcaches,
+                                            sage_zero_copy=request.sage_blocks_transferred,
+                                            state=state,
+                                            suffix_len=request.query_token_count,
+                                        )
+                                        # Hash pre-TTFT state for tokenwise
+                                elif (
+                                    self._sage_method == SageMethod.MAGNET
+                                    and is_pre_ttft_step
+                                ):
+                                        # Magnet (query-aware adaptive): score with
+                                        # attention-weighted importance and recompute
+                                        # tokens exceeding threshold p.
+                                        logger.info(
+                                            "[SAGE_PATH] request=%s → EXEC:magnet_pre_ttft",
+                                            request.req_id,
+                                        )
+                                        self._run_magnet_pre_ttft(
+                                            req_id=request.req_id,
+                                            blend_tokens=blend_tokens,
+                                            sage_token_mask=sage_token_mask,
+                                            blend_slot_mapping=blend_slot_mapping,
+                                            blend_block_table=blend_block_table,
+                                            kvcaches=kvcaches,
+                                            sage_zero_copy=request.sage_blocks_transferred,
+                                            state=state,
+                                            suffix_len=request.query_token_count,
+                                            chunk_boundaries=_chunk_bounds,
+                                        )
+                                elif (
+                                    self._sage_method == SageMethod.MAGNET
+                                    and not is_pre_ttft_step
+                                ):
+                                        # Magnet decode-time: no-op here.
+                                        # Recomputation of newly-identified
+                                        # anchors happens via fused-inject
+                                        # in the NEXT decode forward
+                                        # (populated by the decode hook's
+                                        # final post-hook). The request is
+                                        # marked completed after pre-TTFT,
+                                        # so this branch should be rare.
+                                        logger.info(
+                                            "[SAGE_PATH] request=%s → "
+                                            "SKIP:magnet (fused-inject path)",
+                                            request.req_id,
+                                        )
                                 else:
+                                    # SG path: blend_from_gpu handles sync cacheblend.
+                                    # MG path should never reach here — early_blend_done
+                                    # at the layerwise pre-TTFT check (above) skips this.
+                                    assert not LMCacheConnectorV1Impl._shared_early_blend_done.get(
+                                        request.req_id, False
+                                    ), (
+                                        f"Double processing: sage_process_layer already "
+                                        f"blended {request.req_id} but blend_from_gpu "
+                                        f"is about to run again"
+                                    )
                                     logger.info(
                                         "[SAGE_PATH] request=%s → EXEC:sync_cacheblend",
                                         request.req_id,
@@ -1770,18 +2856,25 @@ class LMCacheConnectorV1Impl:
                                         blend_token_mask,
                                         step_recompute_ratio=step_recompute_ratio,
                                         suffix_len=request.query_token_count,
+                                        include_suffix=True,
                                         kvcaches=kvcaches,
                                         slot_mapping=blend_slot_mapping,
                                         block_table=blend_block_table,
                                         sage_zero_copy=request.sage_blocks_transferred,
                                     )
-                                logger.info(
-                                    "[SAGE_INCREMENTAL] Ran sync blend request=%s "
-                                    "decode_step=%d ratio=%s",
-                                    request.req_id,
-                                    state.decode_step if state is not None else -1,
-                                    step_recompute_ratio,
-                                )
+                                    self._sage_incremental_completed_requests.add(
+                                        request.req_id
+                                    )
+                                    # Hash all layers after sync CB (same point for both SKIP and EXEC)
+                                    logger.info(
+                                        "[SAGE_INCREMENTAL] Ran sync blend "
+                                        "request=%s decode_step=%d ratio=%s",
+                                        request.req_id,
+                                        state.decode_step
+                                        if state is not None
+                                        else -1,
+                                        step_recompute_ratio,
+                                    )
                             else:
                                 logger.info(
                                     "[SAGE_INCREMENTAL] request=%s skipped blend after "
@@ -2045,361 +3138,735 @@ class LMCacheConnectorV1Impl:
                 return input_ids, positions, logits_indices, inputs_embeds
             return input_ids, positions, logits_indices
 
-        # ── Late injection optimization (single-request only) ──
-        # If payload has pre-computed hidden_states from the scoring step,
-        # skip layers 0-1 using PyTorch hooks on decoder layers.
-        # Layers 0-1 process only the decode token; layers 2+ get M+1 tokens.
-        # TODO: extend to multi-request batches.
-        if num_reqs == 1:
-            payload = pending.get(req_ids[0])
-            inject_layer = payload.get("inject_layer") if payload else None
-            if (
-                inject_layer is not None
-                and "hidden_states" in payload
-                and inject_layer < self.blender.num_layers
-            ):
-                from vllm.forward_context import get_forward_context
-                m_tokens = per_req_m[0]
-                fused_positions = payload["positions"]
-                sort_idx = torch.argsort(fused_positions)
-                sorted_positions = fused_positions[sort_idx].to(
-                    device=positions.device, dtype=positions.dtype
-                )
-                _device = positions.device
-                sorted_hidden = payload["hidden_states"][sort_idx].to(
-                    device=_device
-                )
-                sorted_residual = payload["residual"][sort_idx].to(
-                    device=_device
-                )
-                sorted_slots = payload["slots"][sort_idx].to(
-                    device=orig_slot_mapping.device,
-                    dtype=orig_slot_mapping.dtype,
-                )
+        # ── Per-request late injection (unified path for any num_reqs) ──
+        #
+        # For each request r in the batch:
+        #   - decode tokens (d_r ≥ 1) flow through every layer 0..N-1
+        #   - replay tokens (M_r ≥ 0) enter at inject_layer_r and exit at
+        #     extract_layer_r (or ride to the final layer for tokenwise)
+        #
+        # The batch shape changes layer-by-layer based on which requests
+        # are currently in their replay window. Hooks at each transition
+        # layer reshape the batch to match the next stretch.
+        #
+        # Layout invariant: at every layer, the batch is laid out as
+        #   [span_0, span_1, ..., span_{num_reqs-1}]
+        # where each span_r is [replay_r_rows (if active), decode_r_rows].
+        # The order of requests matches model_runner.input_batch.req_ids.
+        return self._sage_per_request_late_inject(
+            model_runner=model_runner,
+            input_ids=input_ids,
+            positions=positions,
+            logits_indices=logits_indices,
+            attn_metadata=attn_metadata,
+            num_reqs=num_reqs,
+            inputs_embeds=inputs_embeds,
+            req_ids=req_ids,
+            pending=pending,
+            per_req_m=per_req_m,
+            orig_starts=orig_starts,
+            orig_slot_mapping=orig_slot_mapping,
+            is_multimodal=_is_multimodal,
+        )
 
-                extract_layer = payload.get("extract_layer")  # None for tokenwise
+    def _sage_per_request_late_inject(
+        self,
+        model_runner: Any,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        logits_indices: torch.Tensor,
+        attn_metadata: Any,
+        num_reqs: int,
+        inputs_embeds: torch.Tensor,
+        req_ids: list,
+        pending: dict,
+        per_req_m: list,
+        orig_starts: list,
+        orig_slot_mapping: torch.Tensor,
+        is_multimodal: bool,
+    ):
+        """Per-request late-injection forward setup.
 
-                # Register PyTorch hooks on decoder layers for injection/extraction.
-                # Access decoder layers generically:
-                #   Text: model → .model → .model → .layers
-                #   VL:   model → .language_model → .model → .layers
-                _inner_model = model_runner.model
-                # VL models wrap the LM in .language_model
-                if hasattr(_inner_model, "language_model"):
-                    _inner_model = _inner_model.language_model
-                for _attr in ("model", "model"):
-                    if hasattr(_inner_model, _attr):
-                        _inner_model = getattr(_inner_model, _attr)
-                _model_layers = _inner_model.layers
-                _inject_hidden = sorted_hidden
-                _inject_residual = sorted_residual
-                _inject_positions = sorted_positions
-                _hook_handles: list = []
-                # Mutable container for positions (shared across layers after injection)
-                _positions_ref = [positions]
+        Builds per-stretch attention metadata and registers PyTorch hooks
+        on decoder layers so that each request's M_r replay tokens enter
+        at its own inject_layer_r (with the saved boundary hidden state)
+        and exit at its own extract_layer_r (saving the new boundary back
+        to per-request state).
 
-                # Track whether injection happened (mutable flag for closures).
-                _injected = [False]
-                _expanded_positions = [None]
+        For tokenwise (extract_layer is None), the replay tokens ride to
+        the final layer alongside the decode tokens.
 
-                def _inject_pre_hook(module, args):
-                    # First target layer: prepend M replay tokens.
-                    pos, hs, res = args
-                    new_hs = torch.cat([_inject_hidden, hs], dim=0)
-                    if res is not None:
-                        new_res = torch.cat([_inject_residual, res], dim=0)
-                    else:
-                        new_res = _inject_residual
-                    if pos.dim() == 2 and _inject_positions.dim() == 1:
-                        # M-RoPE: pos is [3, seq_len]. Get 3D positions from
-                        # the request's pre-computed mrope_positions tensor.
-                        _replay_pos_indices = _inject_positions.long()
-                        _rid = req_ids[0] if len(req_ids) == 1 else None
-                        _req_state = (
-                            model_runner.requests.get(_rid) if _rid else None
-                        )
-                        if (
-                            _req_state is not None
-                            and _req_state.mrope_positions is not None
-                        ):
-                            _mrope = _req_state.mrope_positions
-                            _idx_cpu = _replay_pos_indices.cpu()
-                            _replay_3d = _mrope[
-                                :, _idx_cpu
-                            ].to(device=pos.device)
-                        else:
-                            # Fallback: broadcast 1D positions to 3D
-                            _replay_3d = _inject_positions.unsqueeze(0).expand(
-                                pos.shape[0], -1
-                            )
-                        new_pos = torch.cat([_replay_3d, pos], dim=1)
-                    else:
-                        new_pos = torch.cat([_inject_positions, pos], dim=0)
-                    _injected[0] = True
-                    _expanded_positions[0] = new_pos
-                    return (new_pos, new_hs, new_res)
+        Returns the updated (input_ids, positions, logits_indices, inputs_embeds)
+        for layer-0 input. Note layer 0 still sees the unmodified
+        decode-only batch — the replay rows get spliced in later by hooks.
+        """
+        from dataclasses import replace as dc_replace
+        from vllm.forward_context import get_forward_context as _get_fwd_ctx
+        import time as _time
 
-                def _expand_positions_pre_hook(module, args):
-                    # Subsequent target layers: hidden_states already has M+1 rows
-                    # (from previous layer output), but positions is still 1 row
-                    # (from the model loop). Expand positions to match.
-                    if not _injected[0] or _expanded_positions[0] is None:
-                        return args
-                    pos, hs, res = args
-                    # Compare sequence length dimension (last dim for M-RoPE)
-                    pos_seqlen = pos.shape[-1] if pos.dim() == 2 else pos.shape[0]
-                    if pos_seqlen < hs.shape[0]:
-                        return (_expanded_positions[0], hs, res)
-                    return args
+        _t_setup_start = _time.perf_counter()
 
-                h = _model_layers[inject_layer].register_forward_pre_hook(_inject_pre_hook)
-                _hook_handles.append(h)
-                # Register position-expansion hooks on all subsequent target layers.
-                _end_layer = extract_layer if extract_layer is not None else len(_model_layers)
-                for _li in range(inject_layer + 1, min(_end_layer, len(_model_layers))):
-                    h = _model_layers[_li].register_forward_pre_hook(_expand_positions_pre_hook)
-                    _hook_handles.append(h)
-
-                if extract_layer is not None:
-                    from vllm.forward_context import get_forward_context as _get_fwd_ctx
-                    _extract_M = m_tokens
-
-                    def _extract_post_hook(module, args, output):
-                        # output = (hidden_states, residual)
-                        hs, res = output
-                        fwd_ctx = _get_fwd_ctx()
-                        fwd_ctx.sage_extract_result = {
-                            'hidden_states': hs[:_extract_M].detach().clone(),
-                            'residual': res[:_extract_M].detach().clone(),
-                        }
-                        return (hs[_extract_M:], res[_extract_M:])
-
-                    h = _model_layers[extract_layer - 1].register_forward_hook(_extract_post_hook)
-                    _hook_handles.append(h)
-
-                    # Pre-hook on extract_layer to shrink positions back
-                    # (post-hook on extract_layer-1 shrank hidden/residual,
-                    # but positions still has M+1 entries).
-                    def _shrink_positions_pre_hook(module, args):
-                        pos, hs, res = args
-                        if pos.dim() == 2:
-                            # M-RoPE: [3, seq_len] → slice on dim 1
-                            if pos.shape[1] > hs.shape[0]:
-                                pos = pos[:, _extract_M:]
-                        elif pos.shape[0] > hs.shape[0]:
-                            pos = pos[_extract_M:]
-                        return (pos, hs, res)
-
-                    if extract_layer < len(_model_layers):
-                        h = _model_layers[extract_layer].register_forward_pre_hook(
-                            _shrink_positions_pre_hook
-                        )
-                        _hook_handles.append(h)
-
-                # Store handles for cleanup in wait_for_save.
-                self._sage_inject_hook_handles = _hook_handles
-
-                # Expanded slot_mapping for target layers:
-                # [M replay slots, decode slot]
-                new_slot_mapping = torch.cat(
-                    [sorted_slots, orig_slot_mapping], dim=0
-                )
-                _cur_len = inputs_embeds.shape[0] if _is_multimodal else int(input_ids.shape[0])
-                new_num_tokens_expanded = _cur_len + m_tokens
-                expanded_query_start_loc = torch.tensor(
-                    [0, new_num_tokens_expanded],
-                    device=orig_slot_mapping.device,
-                    dtype=torch.int32,
-                )
-
-                # Create expanded metadata for target layers only.
-                # All layers share the same object — use dataclasses.replace
-                # to create a new instance for the target range.
-                from dataclasses import replace as dc_replace
-                orig_meta = next(iter(attn_metadata.values()))
-                expanded_meta = dc_replace(
-                    orig_meta,
-                    slot_mapping=new_slot_mapping,
-                    num_actual_tokens=new_num_tokens_expanded,
-                    max_query_len=m_tokens + 1,
-                    query_start_loc=expanded_query_start_loc,
-                    scheduler_metadata=None,
-                )
-                expanded_meta.sage_fused_replay_count = m_tokens
-                # For tokenwise (no extract_layer): layers >= inject_layer.
-                # For layerwise (with extract_layer): layers in [inject, extract).
-                _end = extract_layer if extract_layer is not None else float('inf')
-                for layer_name in list(attn_metadata.keys()):
-                    layer_idx = None
-                    for part in layer_name.split('.'):
-                        try:
-                            layer_idx = int(part)
-                        except ValueError:
-                            pass
-                    if layer_idx is None:
-                        continue
-                    if layer_idx < inject_layer or layer_idx >= _end:
-                        continue  # keep original metadata
-                    attn_metadata[layer_name] = expanded_meta
-
-                # logits_indices: decode token stays at position 0 for
-                # layerwise (extraction removes M tokens before final layer),
-                # or at position M for tokenwise (M+1 tokens through to end).
-                if extract_layer is not None:
-                    new_logits_indices = logits_indices  # unchanged — decode at pos 0
-                else:
-                    new_logits_indices = torch.tensor(
-                        [m_tokens],
-                        device=logits_indices.device,
-                        dtype=logits_indices.dtype,
-                    )
-                self._fused_inject_active.update(pending.keys())
-                logger.info(
-                    "[SAGE_FUSED] Late injection at layer %d%s: M=%d tokens",
-                    inject_layer,
-                    f" extract={extract_layer}" if extract_layer else "",
-                    m_tokens,
-                )
-                if _is_multimodal:
-                    return input_ids, positions, new_logits_indices, inputs_embeds
-                return input_ids, positions, new_logits_indices
-
-        _cur_tokens = inputs_embeds.shape[0] if _is_multimodal else int(input_ids.shape[0])
-        new_num_tokens = _cur_tokens + total_M
-        _device = positions.device
-        position_device = positions.device
+        device = positions.device
         slot_device = orig_slot_mapping.device
 
-        new_input_ids = None
-        new_inputs_embeds = None
-        if _is_multimodal:
-            new_inputs_embeds = torch.empty(
-                (new_num_tokens, inputs_embeds.shape[1]),
-                device=_device, dtype=inputs_embeds.dtype,
+        # Per-step counters for the verify summary log.
+        _verify_counters = {
+            "transition_hook_calls": 0,
+            "transition_hook_total_us": 0.0,
+            "inject_count": 0,
+            "extract_count": 0,
+        }
+
+        # ── Per-request entries: collect M_r, inject/extract layers, and
+        # the sorted replay tensors for each pending request.
+        # entries: list of dicts keyed by req_idx with all per-request data.
+        entries: list[dict] = []
+        for req_idx, rid in enumerate(req_ids):
+            payload = pending.get(rid)
+            if payload is None or per_req_m[req_idx] == 0:
+                continue
+            inject_layer = payload.get("inject_layer")
+            if inject_layer is None or "hidden_states" not in payload:
+                # No late-injection metadata; skip this request entirely
+                # (it'll fall through to the no-injection path below if
+                # nothing remains).
+                continue
+            extract_layer = payload.get("extract_layer")  # None for tokenwise
+
+            fused_positions = payload["positions"]
+            sort_idx = torch.argsort(fused_positions)
+            sorted_positions = fused_positions[sort_idx].to(
+                device=device, dtype=positions.dtype,
+            )
+            sorted_hidden = payload["hidden_states"][sort_idx].to(device=device)
+            sorted_residual = (
+                payload["residual"][sort_idx].to(device=device)
+                if payload.get("residual") is not None else None
+            )
+            sorted_slots = payload["slots"][sort_idx].to(
+                device=slot_device, dtype=orig_slot_mapping.dtype,
+            )
+            sorted_token_ids = None
+            if not is_multimodal:
+                sorted_token_ids = payload["token_ids"][sort_idx].to(
+                    device=device, dtype=input_ids.dtype,
+                )
+
+            entries.append({
+                "req_idx": req_idx,
+                "rid": rid,
+                "M_r": per_req_m[req_idx],
+                "inject_layer": int(inject_layer),
+                "extract_layer": (
+                    int(extract_layer) if extract_layer is not None else None
+                ),
+                "positions": sorted_positions,
+                "hidden": sorted_hidden,
+                "residual": sorted_residual,
+                "slots": sorted_slots,
+                "token_ids": sorted_token_ids,
+            })
+
+        if not entries:
+            # No requests have late-injection metadata; nothing to do.
+            if is_multimodal:
+                return input_ids, positions, logits_indices, inputs_embeds
+            return input_ids, positions, logits_indices
+
+        # ── Resolve decoder layers (works for text and VL models).
+        _inner_model = model_runner.model
+        if hasattr(_inner_model, "language_model"):
+            _inner_model = _inner_model.language_model
+        for _attr in ("model", "model"):
+            if hasattr(_inner_model, _attr):
+                _inner_model = getattr(_inner_model, _attr)
+        _model_layers = _inner_model.layers
+        num_model_layers = len(_model_layers)
+
+        # ── Compute the active set per layer.
+        # active_at_layer[L] = set of req_idx values whose
+        #   inject_layer_r ≤ L < extract_layer_r (extract_layer_r=∞ if None).
+        active_at_layer: list[set[int]] = [set() for _ in range(num_model_layers + 1)]
+        for entry in entries:
+            r_idx = entry["req_idx"]
+            il = entry["inject_layer"]
+            xl = entry["extract_layer"] if entry["extract_layer"] is not None else num_model_layers
+            for L in range(il, min(xl, num_model_layers)):
+                active_at_layer[L].add(r_idx)
+
+        # ── Compute the per-request decode lengths from orig_starts.
+        decode_lens = [
+            orig_starts[r + 1] - orig_starts[r] for r in range(num_reqs)
+        ]
+        # Original seq_lens (KV cache lengths per request) — needed for
+        # the per-stretch attn metadata.
+        orig_attn_meta = next(iter(attn_metadata.values()))
+        orig_seq_lens = orig_attn_meta.seq_lens
+        orig_block_table = orig_attn_meta.block_table
+
+        # ── Per-stretch metadata: a "stretch" is a maximal range of
+        # consecutive layers with the same active set. Build one
+        # FlashAttentionMetadata per distinct active set.
+        # Map from frozenset(active_set) -> (slot_mapping, query_start_loc,
+        # block_table, num_actual_tokens, max_query_len, sage_per_req_m,
+        # row_layout) where row_layout describes which row indices in the
+        # batch belong to which (req_idx, "replay"|"decode") group.
+        stretch_meta_cache: dict[frozenset, Any] = {}
+
+        def _build_stretch_meta(active_set: frozenset) -> Any:
+            """Build per-stretch FlashAttentionMetadata for a given active set."""
+            if active_set in stretch_meta_cache:
+                return stretch_meta_cache[active_set]
+
+            new_cu = [0]  # cu_seqlens_q for the spans (1 entry per req)
+            new_slot_segments: list[torch.Tensor] = []
+            new_per_req_m: list[int] = []
+            running_offset = 0
+            for r in range(num_reqs):
+                # Decode rows for r come from orig slot_mapping.
+                d_r = decode_lens[r]
+                decode_slots = orig_slot_mapping[
+                    orig_starts[r]:orig_starts[r + 1]
+                ]
+                if r in active_set:
+                    # Find the entry for r.
+                    entry = next(e for e in entries if e["req_idx"] == r)
+                    m_r = entry["M_r"]
+                    new_slot_segments.append(entry["slots"])
+                    new_slot_segments.append(decode_slots)
+                    span_len = m_r + d_r
+                    new_per_req_m.append(m_r)
+                else:
+                    new_slot_segments.append(decode_slots)
+                    span_len = d_r
+                    new_per_req_m.append(0)
+                running_offset += span_len
+                new_cu.append(running_offset)
+
+            new_slot_mapping = torch.cat(new_slot_segments, dim=0)
+            new_query_start_loc = torch.tensor(
+                new_cu, dtype=torch.int32, device=slot_device,
+            )
+            new_num_tokens = running_offset
+            new_max_query_len = max(
+                new_cu[r + 1] - new_cu[r] for r in range(num_reqs)
+            )
+
+            # Split cu_seqlens_q for replay+decode subsequences so
+            # causal masking is applied within each subsequence, not
+            # across the (replay, decode) boundary. This makes the
+            # split backend-agnostic — no SAGE code needed in
+            # flash_attn.py, triton_attn.py, etc.
+            has_replay = any(m > 0 for m in new_per_req_m)
+            if has_replay:
+                split_cu = [0]
+                split_seq_k: list[int] = []
+                split_block_rows: list[int] = []
+                seq_k_list = orig_seq_lens.tolist()
+                for r in range(num_reqs):
+                    span_start = new_cu[r]
+                    span_end = new_cu[r + 1]
+                    m_r = new_per_req_m[r]
+                    d_r = (span_end - span_start) - m_r
+                    if m_r > 0:
+                        # Cap seqused_k at max_replay_position + 1 so
+                        # the bottom-right causal mask does not extend
+                        # into decode-token KV entries that were generated
+                        # after the prompt.  For contiguous replay
+                        # positions (e.g. suffix rerecompute) this gives
+                        # the exact correct causal window.
+                        _entry_r = next(
+                            e for e in entries if e["req_idx"] == r
+                        )
+                        replay_sk = min(
+                            seq_k_list[r],
+                            int(_entry_r["positions"].max().item()) + 1,
+                        )
+                        split_cu.append(span_start + m_r)
+                        split_seq_k.append(replay_sk)
+                        split_block_rows.append(r)
+                    if d_r > 0:
+                        split_cu.append(span_start + m_r + d_r)
+                        split_seq_k.append(seq_k_list[r])
+                        split_block_rows.append(r)
+                split_query_start_loc = torch.tensor(
+                    split_cu, dtype=torch.int32, device=slot_device,
+                )
+                split_seqused_k = torch.tensor(
+                    split_seq_k, dtype=orig_seq_lens.dtype,
+                    device=orig_seq_lens.device,
+                )
+                split_max_query_len = max(
+                    split_cu[i + 1] - split_cu[i]
+                    for i in range(len(split_cu) - 1)
+                )
+                block_row_idx = torch.tensor(
+                    split_block_rows, dtype=torch.long,
+                    device=orig_block_table.device,
+                )
+                split_block_table = orig_block_table[block_row_idx].contiguous()
+                stretch_meta = dc_replace(
+                    orig_attn_meta,
+                    slot_mapping=new_slot_mapping,
+                    num_actual_tokens=new_num_tokens,
+                    max_query_len=split_max_query_len,
+                    query_start_loc=split_query_start_loc,
+                    seq_lens=split_seqused_k,
+                    block_table=split_block_table,
+                    scheduler_metadata=None,
+                )
+            else:
+                stretch_meta = dc_replace(
+                    orig_attn_meta,
+                    slot_mapping=new_slot_mapping,
+                    num_actual_tokens=new_num_tokens,
+                    max_query_len=new_max_query_len,
+                    query_start_loc=new_query_start_loc,
+                    seq_lens=orig_seq_lens,
+                    block_table=orig_block_table,
+                    scheduler_metadata=None,
+                )
+
+            stretch_meta_cache[active_set] = stretch_meta
+            return stretch_meta
+
+        # ── Build base metadata for "no replays active" (layers before
+        # any inject and after any extract). This is the original layout
+        # but with sage_per_req_m = [0]*num_reqs so flash_attn doesn't
+        # try to apply the late-injection split.
+        base_meta = _build_stretch_meta(frozenset())
+
+        # Patch attn_metadata: for each layer, point to the right stretch.
+        for layer_name in list(attn_metadata.keys()):
+            layer_idx = None
+            for part in layer_name.split('.'):
+                try:
+                    layer_idx = int(part)
+                except ValueError:
+                    pass
+            if layer_idx is None or layer_idx >= num_model_layers:
+                continue
+            active_set = frozenset(active_at_layer[layer_idx])
+            attn_metadata[layer_name] = _build_stretch_meta(active_set)
+
+        # ── Hooks: shape tracker.
+        # _current_active is a mutable single-element list holding the
+        # frozenset of currently-active req_idx values. Updated by
+        # transition hooks.
+        _current_active = [frozenset()]
+        # _current_positions holds the most recently expanded positions
+        # tensor. Non-transition layers in the replay window read from
+        # this so they get the same shape as hidden_states (the model
+        # loop reuses the same `positions` arg across all layers).
+        _current_positions: list[torch.Tensor] = [None]
+
+        # row_indices_for_active(active_set) returns the list of
+        # (req_idx, "replay"|"decode") segments in batch order. Used by
+        # hooks to know where to splice/extract per-request rows.
+        def _layout_for(active_set: frozenset) -> list[tuple]:
+            layout: list[tuple] = []
+            for r in range(num_reqs):
+                if r in active_set:
+                    layout.append((r, "replay"))
+                layout.append((r, "decode"))
+            return layout
+
+        # The set of layers where the active set changes. We register
+        # hooks at these layers.
+        transition_layers: set[int] = set()
+        prev_active: frozenset = frozenset()
+        for L in range(num_model_layers):
+            cur_active = frozenset(active_at_layer[L])
+            if cur_active != prev_active:
+                transition_layers.add(L)
+            prev_active = cur_active
+
+        # Pre-compute per-request decode-row index ranges within the
+        # ORIGINAL (decode-only) batch, used by inject hooks to splice in.
+        decode_orig_starts = list(orig_starts)  # cumulative
+
+        _hook_handles: list = []
+
+        # Build per-request mrope expansion helper (works for both text
+        # and multimodal).
+        def _expand_positions_for_active(
+            current_pos: torch.Tensor, active_set: frozenset,
+        ) -> torch.Tensor:
+            """Construct positions tensor for the new batch shape under
+            active_set, given the current decode-only positions tensor.
+
+            For each request: emit M_r replay positions (if active) then
+            d_r decode positions for that request.
+            """
+            is_mrope = current_pos.dim() == 2
+            if is_mrope:
+                pos_segments = []
+                for r in range(num_reqs):
+                    if r in active_set:
+                        entry = next(e for e in entries if e["req_idx"] == r)
+                        replay_pos_indices = entry["positions"].long()
+                        # M-RoPE: pos is [3, total_decode_tokens]. Look up
+                        # per-request mrope_positions for the M_r replay rows.
+                        _req_state = model_runner.requests.get(entry["rid"])
+                        if (
+                            _req_state is not None
+                            and getattr(_req_state, "mrope_positions", None) is not None
+                        ):
+                            _mrope = _req_state.mrope_positions
+                            _idx_cpu = replay_pos_indices.cpu()
+                            replay_3d = _mrope[:, _idx_cpu].to(device=current_pos.device)
+                        else:
+                            replay_3d = entry["positions"].unsqueeze(0).expand(
+                                current_pos.shape[0], -1,
+                            )
+                        pos_segments.append(replay_3d)
+                    decode_slice = current_pos[
+                        :, decode_orig_starts[r]:decode_orig_starts[r + 1]
+                    ]
+                    pos_segments.append(decode_slice)
+                return torch.cat(pos_segments, dim=1)
+            else:
+                pos_segments = []
+                for r in range(num_reqs):
+                    if r in active_set:
+                        entry = next(e for e in entries if e["req_idx"] == r)
+                        pos_segments.append(entry["positions"])
+                    pos_segments.append(
+                        current_pos[decode_orig_starts[r]:decode_orig_starts[r + 1]]
+                    )
+                return torch.cat(pos_segments, dim=0)
+
+        # Helper: row index ranges in the CURRENT batch for layout.
+        def _row_ranges_for(active_set: frozenset) -> dict:
+            """Return mapping req_idx -> (replay_start, replay_end, decode_start, decode_end)
+            for the current active_set. Replay range is None if request
+            is not active."""
+            ranges: dict = {}
+            cursor = 0
+            for r in range(num_reqs):
+                if r in active_set:
+                    entry = next(e for e in entries if e["req_idx"] == r)
+                    m_r = entry["M_r"]
+                    rep_start = cursor
+                    rep_end = cursor + m_r
+                    cursor = rep_end
+                else:
+                    rep_start = rep_end = None
+                d_r = decode_lens[r]
+                dec_start = cursor
+                dec_end = cursor + d_r
+                cursor = dec_end
+                ranges[r] = (rep_start, rep_end, dec_start, dec_end)
+            return ranges
+
+        # ── Register a transition hook on each transition layer.
+        # The hook reshapes the input by adding rows for entering
+        # requests (with their saved boundary hidden state) and removing
+        # rows for exiting requests (saving their new boundary state to
+        # the forward context).
+
+        def _make_transition_hook(L_local: int):
+            def _hook(module, args):
+                _t_hook = _time.perf_counter()
+                pos, hs, res = args
+                old_active = _current_active[0]
+                new_active = frozenset(active_at_layer[L_local])
+
+                if old_active == new_active:
+                    return args
+
+                # Compute old and new row ranges.
+                old_ranges = _row_ranges_for(old_active)
+                new_ranges = _row_ranges_for(new_active)
+
+                exiting = old_active - new_active
+                entering = new_active - old_active
+
+                # [VERIFY] Per-transition detail log: layer + active set
+                # deltas + entering/exiting request ids. Cheap: just str
+                # formatting + dict lookups, no GPU work.
+                _entry_by_idx = {e["req_idx"]: e for e in entries}
+
+                # Debug: verify decode row mapping
+                _ent_rids = [_entry_by_idx[r]["rid"] for r in sorted(entering)]
+                _exit_rids = [_entry_by_idx[r]["rid"] for r in sorted(exiting)]
+                _stay_rids = [
+                    _entry_by_idx[r]["rid"]
+                    for r in sorted(old_active & new_active)
+                ]
+                # Log per-request row structure at transitions
+                _row_detail = []
+                _nr = _row_ranges_for(new_active)
+                for r in sorted(new_active):
+                    _rs, _re, _ds, _de = _nr[r]
+                    _rid = _entry_by_idx[r]["rid"] if r in _entry_by_idx else f"req{r}"
+                    _row_detail.append(
+                        f"{_rid}:replay=[{_rs},{_re})decode=[{_ds},{_de})"
+                    )
+                logger.info(
+                    "[SAGE_FUSED_VERIFY_T] L=%d hs_in=%d "
+                    "old=%d new=%d enter=%s exit=%s stay=%s "
+                    "rows=[%s] pos=%s",
+                    L_local, hs.shape[0],
+                    len(old_active), len(new_active),
+                    _ent_rids, _exit_rids, _stay_rids,
+                    " ".join(_row_detail),
+                    pos[:min(8, len(pos))].tolist() if pos is not None else "None",
+                )
+                # Save extracted hidden/residual for exiting requests.
+                if exiting:
+                    fwd_ctx = _get_fwd_ctx()
+                    if fwd_ctx.sage_extract_result is None:
+                        fwd_ctx.sage_extract_result = {}
+                    for r in exiting:
+                        rep_s, rep_e, _, _ = old_ranges[r]
+                        if rep_s is None:
+                            continue
+                        entry = next(e for e in entries if e["req_idx"] == r)
+                        fwd_ctx.sage_extract_result[entry["rid"]] = {
+                            "hidden_states": hs[rep_s:rep_e].detach().clone(),
+                            "residual": (
+                                res[rep_s:rep_e].detach().clone()
+                                if res is not None else None
+                            ),
+                        }
+                        _verify_counters["extract_count"] += 1
+
+                # Now build the new hidden_states / residual / positions
+                # tensors with the proper row layout for new_active.
+                new_hs_segments: list[torch.Tensor] = []
+                new_res_segments: list[torch.Tensor] = []
+                for r in range(num_reqs):
+                    if r in new_active:
+                        entry = next(e for e in entries if e["req_idx"] == r)
+                        if r in entering:
+                            # Inject saved boundary hidden state.
+                            new_hs_segments.append(entry["hidden"])
+                            if entry["residual"] is not None:
+                                new_res_segments.append(entry["residual"])
+                            _verify_counters["inject_count"] += 1
+                        else:
+                            # Continuing — copy from current hs.
+                            old_rep_s, old_rep_e, _, _ = old_ranges[r]
+                            new_hs_segments.append(hs[old_rep_s:old_rep_e])
+                            if res is not None:
+                                new_res_segments.append(res[old_rep_s:old_rep_e])
+                    # Decode rows: always carried over from current hs.
+                    old_dec_s = old_ranges[r][2]
+                    old_dec_e = old_ranges[r][3]
+                    new_hs_segments.append(hs[old_dec_s:old_dec_e])
+                    if res is not None:
+                        new_res_segments.append(res[old_dec_s:old_dec_e])
+
+                new_hs = torch.cat(new_hs_segments, dim=0)
+                new_res = (
+                    torch.cat(new_res_segments, dim=0)
+                    if res is not None and new_res_segments else res
+                )
+                new_pos = _expand_positions_for_active(pos, new_active)
+
+                # Per-call shape sanity check (cheap: just int compare).
+                _expected_rows = sum(
+                    (e["M_r"] if e["req_idx"] in new_active else 0)
+                    + decode_lens[e["req_idx"]]
+                    for e in entries
+                )
+                for r in range(num_reqs):
+                    if not any(e["req_idx"] == r for e in entries):
+                        _expected_rows += decode_lens[r]
+                if new_hs.shape[0] != _expected_rows:
+                    logger.error(
+                        "[SAGE_VERIFY] L=%d shape mismatch: hs=%d expected=%d",
+                        L_local, new_hs.shape[0], _expected_rows,
+                    )
+
+                _current_active[0] = new_active
+                _current_positions[0] = new_pos
+                _verify_counters["transition_hook_calls"] += 1
+                _verify_counters["transition_hook_total_us"] += (
+                    (_time.perf_counter() - _t_hook) * 1e6
+                )
+                return (new_pos, new_hs, new_res)
+            return _hook
+
+        # Non-transition pre-hook: layers between transitions reuse the
+        # current positions tensor (the model loop passes the same
+        # original `positions` arg across all layers, but transition
+        # hooks have reshaped hidden_states; we need to keep positions
+        # in sync).
+        def _carry_positions_pre_hook(module, args):
+            pos, hs, res = args
+            cur_pos = _current_positions[0]
+            if cur_pos is None:
+                return args
+            cur_pos_seqlen = (
+                cur_pos.shape[-1] if cur_pos.dim() == 2 else cur_pos.shape[0]
+            )
+            hs_len = hs.shape[0]
+            if cur_pos_seqlen == hs_len:
+                import os as _os_cp
+                return (cur_pos, hs, res)
+            return args
+
+        for L in sorted(transition_layers):
+            h = _model_layers[L].register_forward_pre_hook(_make_transition_hook(L))
+            _hook_handles.append(h)
+
+        # Carry-positions hook on every layer in the affected range
+        # that's NOT a transition layer. This keeps positions in sync
+        # with the (possibly reshaped) hidden_states tensor.
+        if entries:
+            min_inject = min(e["inject_layer"] for e in entries)
+            max_extract = max(
+                e["extract_layer"] if e["extract_layer"] is not None else num_model_layers
+                for e in entries
+            )
+            for L in range(min_inject + 1, max_extract):
+                if L in transition_layers or L >= num_model_layers:
+                    continue
+                h = _model_layers[L].register_forward_pre_hook(_carry_positions_pre_hook)
+                _hook_handles.append(h)
+
+        # Also register a final post-hook on the last layer of any
+        # request whose extract_layer is None (tokenwise) — wait,
+        # tokenwise rides to the final layer. We don't extract those.
+        # We DO need a post-hook on layer (extract_layer - 1) for
+        # layerwise requests where extract_layer == num_model_layers
+        # (i.e., the request would naturally exit at the end).
+        # The transition_layers logic above already handles transitions
+        # at layer extract_layer (request exits when L == extract_layer
+        # and is removed from active set). But the extraction (saving
+        # the boundary) needs to happen on the OUTPUT of the last layer
+        # the request is in (extract_layer - 1), not the INPUT of
+        # extract_layer. The pre-hook approach above does extraction on
+        # the input of layer extract_layer, which corresponds to the
+        # output of layer (extract_layer - 1) — semantically equivalent
+        # because layers don't modify their input.
+        # However if any request's extract_layer == num_model_layers,
+        # there's no layer extract_layer to register a pre-hook on.
+        # Handle that case with a post-hook on the last layer.
+        last_layer_extracts = [
+            e for e in entries
+            if e["extract_layer"] is not None
+            and e["extract_layer"] == num_model_layers
+        ]
+        if last_layer_extracts:
+            def _final_post_hook(module, args, output):
+                hs, res = output
+                fwd_ctx = _get_fwd_ctx()
+                if fwd_ctx.sage_extract_result is None:
+                    fwd_ctx.sage_extract_result = {}
+                final_active = frozenset(_current_active[0])
+                ranges = _row_ranges_for(final_active)
+                for entry in last_layer_extracts:
+                    r = entry["req_idx"]
+                    if r not in final_active:
+                        continue
+                    rep_s, rep_e, _, _ = ranges[r]
+                    if rep_s is None:
+                        continue
+                    fwd_ctx.sage_extract_result[entry["rid"]] = {
+                        "hidden_states": hs[rep_s:rep_e].detach().clone(),
+                        "residual": (
+                            res[rep_s:rep_e].detach().clone()
+                            if res is not None else None
+                        ),
+                    }
+                # Drop the replay rows from the output so the final
+                # logits indexing only sees decode rows.
+                keep_segments_h: list[torch.Tensor] = []
+                keep_segments_r: list[torch.Tensor] = []
+                for r in range(num_reqs):
+                    _, _, dec_s, dec_e = ranges[r]
+                    keep_segments_h.append(hs[dec_s:dec_e])
+                    if res is not None:
+                        keep_segments_r.append(res[dec_s:dec_e])
+                new_hs = torch.cat(keep_segments_h, dim=0)
+                new_res = (
+                    torch.cat(keep_segments_r, dim=0)
+                    if res is not None and keep_segments_r else res
+                )
+                return (new_hs, new_res)
+            h = _model_layers[num_model_layers - 1].register_forward_hook(_final_post_hook)
+            _hook_handles.append(h)
+
+        # Store handles for cleanup in wait_for_save.
+        self._sage_inject_hook_handles = _hook_handles
+
+        # ── Compute the layer-0 input.
+        #
+        # Layer 0 sees the original decode-only batch (no replay rows
+        # yet). The transition hooks will splice rows in at the right
+        # layers. UNLESS layer 0 is itself a transition layer (i.e.,
+        # some request has inject_layer == 0). In that case the hook on
+        # layer 0 will fire and reshape before layer 0's compute, so we
+        # still pass the decode-only input here.
+        #
+        # The initial _current_active is frozenset() (no replay rows
+        # present). We don't actually run with this layout — the first
+        # transition hook updates it.
+
+        # ── logits_indices: where the decode token(s) for each request
+        # land in the FINAL layer's output.
+        #
+        # The final layer's output shape depends on whether any requests
+        # are still active at layer N-1:
+        #   - Layerwise: at the final layer, all requests have exited
+        #     their windows, so the batch is just decode rows in order.
+        #     logits_indices for request r is the position of its last
+        #     decode token in the decode-only batch, which equals
+        #     orig_starts[r+1] - 1 (same as the original).
+        #   - Tokenwise: at the final layer, all tokenwise requests still
+        #     have their replay rows in the batch. logits_indices for
+        #     request r must point to the decode row(s) AFTER the replay
+        #     rows in r's span.
+        # When all entries are layerwise (have extract_layer set), the
+        # final batch is decode-only and logits_indices is unchanged.
+        any_tokenwise = any(e["extract_layer"] is None for e in entries)
+        if any_tokenwise:
+            # Final layer's active set: all requests with extract_layer is None.
+            final_active = frozenset(
+                e["req_idx"] for e in entries if e["extract_layer"] is None
+            )
+            ranges = _row_ranges_for(final_active)
+            new_logits_list = []
+            for r in range(num_reqs):
+                _, _, dec_s, dec_e = ranges[r]
+                # Pick the LAST decode row for each request.
+                new_logits_list.append(dec_e - 1)
+            new_logits_indices = torch.tensor(
+                new_logits_list, device=logits_indices.device,
+                dtype=logits_indices.dtype,
             )
         else:
-            new_input_ids = torch.empty(
-                (new_num_tokens,), device=_device, dtype=input_ids.dtype,
-            )
-        new_positions = torch.empty(
-            (new_num_tokens,), device=position_device, dtype=positions.dtype,
-        )
-        new_slot_mapping = torch.empty(
-            (new_num_tokens,), device=slot_device, dtype=orig_slot_mapping.dtype,
-        )
-        _cached_embeds = getattr(self, "_cached_prompt_embeds", {})
-        write_cursor = 0
-        for req_idx, req_id in enumerate(req_ids):
-            orig_start = orig_starts[req_idx]
-            orig_end = orig_starts[req_idx + 1]
-            m_tokens = per_req_m[req_idx]
-            req_len = orig_end - orig_start
-            # Replay tokens FIRST, then decode token(s).
-            if m_tokens > 0:
-                payload = pending[req_id]
-                fused_positions = payload["positions"].to(
-                    device=position_device, dtype=positions.dtype
-                )
-                fused_slots = payload["slots"].to(
-                    device=slot_device, dtype=orig_slot_mapping.dtype
-                )
-                # Sort replay tokens by position ascending for causal masking.
-                sort_idx = torch.argsort(fused_positions)
-                if _is_multimodal:
-                    # Look up cached embeddings by position.
-                    req_embeds = _cached_embeds.get(req_id)
-                    if req_embeds is not None:
-                        embed_positions = payload["positions"].long()
-                        sorted_embed_positions = embed_positions[sort_idx]
-                        new_inputs_embeds[write_cursor : write_cursor + m_tokens].copy_(
-                            req_embeds[sorted_embed_positions]
-                        )
-                    else:
-                        logger.warning(
-                            "[SAGE_FUSED] No cached embeddings for %s, "
-                            "zeroing replay embeddings", req_id,
-                        )
-                        new_inputs_embeds[write_cursor : write_cursor + m_tokens].zero_()
-                else:
-                    fused_token_ids = payload["token_ids"].to(
-                        device=_device, dtype=input_ids.dtype
-                    )
-                    new_input_ids[write_cursor : write_cursor + m_tokens].copy_(
-                        fused_token_ids[sort_idx]
-                    )
-                new_positions[write_cursor : write_cursor + m_tokens].copy_(
-                    fused_positions[sort_idx]
-                )
-                new_slot_mapping[write_cursor : write_cursor + m_tokens].copy_(
-                    fused_slots[sort_idx]
-                )
-                write_cursor += m_tokens
-            if req_len > 0:
-                if _is_multimodal:
-                    new_inputs_embeds[write_cursor : write_cursor + req_len].copy_(
-                        inputs_embeds[orig_start:orig_end]
-                    )
-                else:
-                    new_input_ids[write_cursor : write_cursor + req_len].copy_(
-                        input_ids[orig_start:orig_end]
-                    )
-                new_positions[write_cursor : write_cursor + req_len].copy_(
-                    positions[orig_start:orig_end]
-                )
-                new_slot_mapping[write_cursor : write_cursor + req_len].copy_(
-                    orig_slot_mapping[orig_start:orig_end]
-                )
-                write_cursor += req_len
-        cumulative_shift = 0
-        for req_idx, m_tokens in enumerate(per_req_m):
-            cumulative_shift += m_tokens
-            if cumulative_shift:
-                model_runner.query_start_loc.gpu[req_idx + 1] += cumulative_shift
-
-        # Decode tokens are now LAST in each request's span (after M replay
-        # tokens).  logits_indices must point to the decode token position,
-        # which is the last token in each request's new span.
-        new_logits_indices = model_runner.query_start_loc.gpu[1 : num_reqs + 1] - 1
-
-        # Compute new max_query_len across all requests.
-        new_max_query_len = int(
-            (model_runner.query_start_loc.gpu[1 : num_reqs + 1]
-             - model_runner.query_start_loc.gpu[:num_reqs]).max().item()
-        )
-
-        # Update all per-layer FlashAttentionMetadata instances in-place.
-        # Invalidate scheduler_metadata since it was computed for the
-        # original batch shape.  Setting to None makes flash_attn use
-        # its built-in heuristics instead of the stale AOT schedule.
-        # Also store sage_fused_replay_count so flash_attn.py can split
-        # the batch into 2 sequences (replay M + decode 1) with correct
-        # causal masking instead of treating all M+1 tokens as one
-        # sequence where replay tokens see future keys.
-        # Only set sage_fused_replay_count for single-request batches
-        # where the layout is guaranteed to be [replay(M), decode(1)].
-        # Multi-request batches interleave replay/decode per-request,
-        # which requires per-request splitting (not yet implemented).
-        _set_replay_count = total_M if num_reqs == 1 else 0
-        for layer_meta in attn_metadata.values():
-            layer_meta.slot_mapping = new_slot_mapping
-            layer_meta.num_actual_tokens = new_num_tokens
-            layer_meta.max_query_len = new_max_query_len
-            layer_meta.scheduler_metadata = None
-            layer_meta.sage_fused_replay_count = _set_replay_count
+            new_logits_indices = logits_indices
 
         # Record injected requests for completion tracking in wait_for_save.
-        for rid in pending:
-            self._fused_inject_active.add(rid)
+        for entry in entries:
+            self._fused_inject_active.add(entry["rid"])
+
+        # The transition hooks haven't fired yet — they fire during the
+        # forward pass. Stash the counters dict on the adapter so the
+        # hooks can update it, and we'll log the totals after the forward
+        # pass completes (in wait_for_save).
+        self._sage_last_inject_counters = _verify_counters
+        self._sage_last_inject_counters["entries"] = len(entries)
+        self._sage_last_inject_counters["transitions"] = len(transition_layers)
+        self._sage_last_inject_counters["setup_us"] = (
+            (_time.perf_counter() - _t_setup_start) * 1e6
+        )
 
         logger.info(
-            "[SAGE_FUSED] Injected M=%d recompute tokens; batch now %d tokens "
-            "(replay first, decode last)",
-            total_M,
-            new_num_tokens,
+            "[SAGE_FUSED] Per-request late injection: %d entries, "
+            "%d transition layers, setup_us=%.0f",
+            len(entries),
+            len(transition_layers),
+            self._sage_last_inject_counters["setup_us"],
         )
-        if _is_multimodal:
-            return new_input_ids, new_positions, new_logits_indices, new_inputs_embeds
-        return new_input_ids, new_positions, new_logits_indices
+
+        if is_multimodal:
+            return input_ids, positions, new_logits_indices, inputs_embeds
+        return input_ids, positions, new_logits_indices
 
     def record_failed_blocks(
         self,
@@ -2644,8 +4111,10 @@ class LMCacheConnectorV1Impl:
                                 _f.write(f"{rid} {wall_ms:.3f}\n")
                         except Exception:
                             pass
-                # Check for layerwise extraction result: the model forward
-                # saved M replay tokens' boundary state after the target layers.
+                # Check for layerwise extraction result: the per-request
+                # extract hooks saved each request's M replay tokens'
+                # boundary state after that request's extract layer.
+                # Format: dict[req_id -> {hidden_states, residual}].
                 from vllm.forward_context import get_forward_context
                 try:
                     _fwd_ctx = get_forward_context()
@@ -2653,11 +4122,11 @@ class LMCacheConnectorV1Impl:
                 except Exception:
                     _extract = None
                 if _extract is not None:
-                    for rid in list(self._fused_inject_active):
+                    for rid, payload in _extract.items():
                         _state = self._sage_incremental_states.get(rid)
-                        if _state is not None:
-                            _state.layerwise_saved_hidden = _extract['hidden_states']
-                            _state.layerwise_saved_residual = _extract['residual']
+                        if _state is not None and payload is not None:
+                            _state.layerwise_saved_hidden = payload['hidden_states']
+                            _state.layerwise_saved_residual = payload['residual']
                     _fwd_ctx.sage_extract_result = None
 
                 self._fused_inject_active.clear()
@@ -2666,6 +4135,40 @@ class LMCacheConnectorV1Impl:
                 for h in self._sage_inject_hook_handles:
                     h.remove()
                 self._sage_inject_hook_handles.clear()
+
+                # Suffix rerecompute completion: when a suffix inject
+                # finishes, mark the request as completed.
+                _suffix_done = []
+                for rid in list(self._sage_suffix_rerecompute_pending):
+                    if (
+                        rid not in self._fused_inject_pending
+                        and rid not in self._fused_inject_active
+                    ):
+                        _suffix_done.append(rid)
+                for rid in _suffix_done:
+                    self._sage_suffix_rerecompute_pending.discard(rid)
+                    self._sage_incremental_completed_requests.add(rid)
+                    logger.info(
+                        "[SAGE_SUFFIX_RERECOMPUTE_DONE] req=%s",
+                        rid,
+                    )
+
+                # Per-step verification summary (cheap: read 6 ints/floats).
+                _ctr = getattr(self, "_sage_last_inject_counters", None)
+                if _ctr is not None:
+                    logger.info(
+                        "[SAGE_FUSED_VERIFY] entries=%d transitions=%d "
+                        "hook_calls=%d hook_total_us=%.0f "
+                        "injects=%d extracts=%d setup_us=%.0f",
+                        _ctr.get("entries", 0),
+                        _ctr.get("transitions", 0),
+                        _ctr["transition_hook_calls"],
+                        _ctr["transition_hook_total_us"],
+                        _ctr["inject_count"],
+                        _ctr["extract_count"],
+                        _ctr.get("setup_us", 0.0),
+                    )
+                    self._sage_last_inject_counters = None
 
             return
 

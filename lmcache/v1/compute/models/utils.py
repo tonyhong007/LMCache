@@ -50,6 +50,10 @@ def infer_model_from_vllm(vllm_model, blender, enable_sparse: bool = False):
         from lmcache.v1.compute.models.qwen3 import LMCQwen3Model
 
         return LMCQwen3Model(vllm_model, blender, enable_sparse)
+    elif model_name == "Gemma3ForCausalLM":
+        from lmcache.v1.compute.models.gemma3 import LMCGemma3Model
+
+        return LMCGemma3Model(vllm_model, blender, enable_sparse)
     else:
         # TODO(Jiayi): Add support for more models
         raise NotImplementedError(

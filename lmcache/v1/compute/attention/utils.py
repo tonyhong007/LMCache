@@ -2,6 +2,7 @@
 # Local
 from .flash_attn import LMCFlashAttnBackend
 from .flash_infer_sparse import LMCFlashInferSparseBackend
+from .triton_attn import LMCTritonAttnBackend
 
 
 def infer_attn_backend_from_vllm(vllm_attn, enable_sparse=False):
@@ -10,5 +11,7 @@ def infer_attn_backend_from_vllm(vllm_attn, enable_sparse=False):
         return LMCFlashInferSparseBackend(vllm_attn)
     elif attn_name == "FlashAttentionImpl" and not enable_sparse:
         return LMCFlashAttnBackend(vllm_attn)
+    elif attn_name == "TritonAttentionImpl" and not enable_sparse:
+        return LMCTritonAttnBackend(vllm_attn)
     else:
         raise ValueError(f"Attention backend {attn_name} is not supported in LMCache.")

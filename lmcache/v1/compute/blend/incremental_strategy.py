@@ -50,6 +50,21 @@ class IncrementalBlendState:
     # Mean diff_k from scoring layer (per-token average).
     # Used by adaptive layerwise schedule to front-load layers when cache is stale.
     layerwise_diff_k_mean: Optional[float] = None
+    # SAGE pipelined-blend optimization: set to True when the pre-TTFT
+    # blend has been run early (before the parent enters the scheduler).
+    # The model-forward path checks this flag and skips the duplicate
+    # blend invocation.
+    early_blend_done: bool = False
+
+    # ── Token-wise scoring boundary (per-request copy) ──
+    # Captured at scoring time so concurrent requests don't race on the
+    # blender's shared `_scoring_boundary_*` fields. Used by the
+    # tokenwise decode-step injection path to skip layers below the
+    # scoring boundary layer.
+    tokenwise_boundary_hidden: Optional[Any] = None
+    tokenwise_boundary_residual: Optional[Any] = None
+    tokenwise_boundary_layer: Optional[int] = None
+    tokenwise_boundary_pos_to_row: Optional[Any] = None
 
 
 @dataclass
@@ -241,6 +256,68 @@ class LayerWiseIncrementalBlendStrategy(IncrementalBlendStrategy):
         return step
 
 
+class MagnetIncrementalBlendStrategy(IncrementalBlendStrategy):
+    """
+    Magnet: query-aware adaptive reconciliation (ProphetKV-style).
+
+    Pre-TTFT: compute attention-weighted importance from suffix queries
+    to context tokens at the check layer. Recompute all tokens whose
+    importance exceeds threshold p.
+
+    Decoding: at each decode step, re-score with the new decode token's
+    attention distribution. Any context token that newly crosses
+    threshold p gets incrementally recomputed. Continues until the
+    adaptive threshold no longer fires (no new anchor tokens) or until
+    a safety budget cap is hit.
+
+    Threshold p is hardcoded (0.01) for now; tune later.
+    Safety budget cap via max_ratio (default 1.0 = no cap).
+    """
+
+    def __init__(self, threshold: float, max_ratio: float):
+        self.threshold = max(0.0, float(threshold))
+        self.max_ratio = _normalize_ratio(max_ratio)
+        logger.info(
+            "[SAGE_INCREMENTAL] Magnet strategy initialized: "
+            "threshold=%.6f, max_ratio=%.4f",
+            self.threshold,
+            self.max_ratio,
+        )
+
+    def should_continue(self, state: IncrementalBlendState) -> bool:
+        # Safety cap: don't exceed max_ratio of the context as anchors.
+        if state.cumulative_ratio + 1e-8 >= self.max_ratio:
+            logger.info(
+                "[SAGE_INCREMENTAL] Magnet budget cap reached: "
+                "cumulative_ratio=%.4f, max_ratio=%.4f",
+                state.cumulative_ratio, self.max_ratio,
+            )
+            return False
+        return True
+
+    def next_step(self, state: IncrementalBlendState, num_layers: int) -> IncrementalBlendStep:
+        del num_layers
+        state.decode_step += 1
+        if not self.should_continue(state):
+            return IncrementalBlendStep(
+                should_blend=False,
+                reason="magnet safety budget exhausted",
+            )
+        # Unlike tokenwise, the recompute ratio for magnet is not a fixed
+        # step. The adapter layer computes the set of NEW anchor tokens
+        # at this decode step and determines the ratio dynamically.
+        step = IncrementalBlendStep(
+            should_blend=True,
+            recompute_ratio=None,  # determined by adapter (dynamic)
+            reason=(
+                f"magnet decode_step={state.decode_step}, "
+                f"threshold={self.threshold:.6f}"
+            ),
+        )
+        logger.info("[SAGE_INCREMENTAL] %s", step.reason)
+        return step
+
+
 def build_incremental_blend_strategy(config) -> Optional[IncrementalBlendStrategy]:
     strategy_name = (
         getattr(config, "blend_incremental_strategy", None) or "none"
@@ -277,12 +354,20 @@ def build_incremental_blend_strategy(config) -> Optional[IncrementalBlendStrateg
             num_model_layers=0,  # patched by adapter
         )
 
+    if strategy_name in ("magnet"):
+        # Threshold overridable via SAGE_MAGNET_THRESHOLD env var; default 0.08.
+        threshold = float(os.environ.get("SAGE_MAGNET_THRESHOLD", "0.08"))
+        return MagnetIncrementalBlendStrategy(
+            threshold=threshold,
+            max_ratio=float(max_ratio),
+        )
+
     logger.error(
         "[SAGE_INCREMENTAL] Unsupported incremental strategy '%s'. "
-        "Supported values: none, token_wise, layer_wise.",
+        "Supported values: none, token_wise, layer_wise, magnet.",
         strategy_name,
     )
     raise ValueError(
         f"Unknown blend incremental strategy '{strategy_name}'. "
-        "Supported values: none, token_wise, layer_wise."
+        "Supported values: none, token_wise, layer_wise, magnet."
     )
