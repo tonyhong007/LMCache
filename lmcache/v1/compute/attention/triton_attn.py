@@ -39,6 +39,11 @@ class LMCTritonAttnBackend(AttentionInterface):
         self.num_heads = vllm_attn.num_heads
         self.num_kv_heads = vllm_attn.num_kv_heads
         self.head_size = vllm_attn.head_size
+        sw = getattr(vllm_attn.impl, "sliding_window", None)
+        if sw is None or (isinstance(sw, tuple) and sw[0] < 0):
+            self.sliding_window_left: int | None = None
+        else:
+            self.sliding_window_left = int(sw[0])
 
         idx = torch.cuda.current_device()
         self.device = torch.device(f"cuda:{idx}")
@@ -64,11 +69,42 @@ class LMCTritonAttnBackend(AttentionInterface):
             k = k.repeat_interleave(repeat, dim=1)
             v = v.repeat_interleave(repeat, dim=1)
 
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            is_causal=True,
-            scale=self.scale,
-        )
+        M = q.shape[-2]
+        N = k.shape[-2]
+        real_pos = getattr(attn_metadata, "original_q_positions", None)
+        if real_pos is not None and real_pos.numel() == M:
+            rp = real_pos.to(device=q.device, dtype=torch.long)
+            qpos = rp.unsqueeze(1)
+            if M == N:
+                # Sliced both ways: K rows correspond to same real positions.
+                kpos = rp.unsqueeze(0)
+            else:
+                # Sliced Q against full K: K covers positions 0..N-1.
+                kpos = torch.arange(
+                    N, device=q.device, dtype=torch.long,
+                ).unsqueeze(0)
+        else:
+            # Full path: queries align bottom-right of keys.
+            qpos = torch.arange(
+                N - M, N, device=q.device, dtype=torch.long,
+            ).unsqueeze(1)
+            kpos = torch.arange(
+                N, device=q.device, dtype=torch.long,
+            ).unsqueeze(0)
+
+        if self.sliding_window_left is None and real_pos is None:
+            # Fast path: no sliding and no real-position remap needed.
+            out = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, scale=self.scale,
+            )
+        else:
+            diff = qpos - kpos
+            mask = diff >= 0
+            if self.sliding_window_left is not None:
+                mask = mask & (diff <= self.sliding_window_left)
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, is_causal=False, scale=self.scale,
+            )
         # [1, H, M, D] -> [M, H, D]
         out = out.squeeze(0).transpose(0, 1).contiguous()
         output[:] = out

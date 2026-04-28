@@ -24,6 +24,17 @@ def _magnet_alpha_block(
     scale: float,
     bf16_scoring: bool,
 ) -> "torch.Tensor":
+    """Per-key α = mean over (heads, groups, queries) of the softmax
+    attention probability. Returns values in [0, 1] — each row of the
+    softmax sums to 1, so averaging across all three dims yields a
+    probability-scale score independent of Q_s.
+
+    Why mean and not sum over Q_s: top-k is invariant under sum/mean
+    (monotonic), but threshold comparisons are not. Sum-over-Q_s makes
+    the score range [0, Q_s], so a fixed threshold means different
+    things when Q_s changes (pre-TTFT vs decode-time rescoring). Mean
+    keeps the threshold Q_s-invariant and interpretable (above 1/N =
+    above uniform attention). For top-k mode this is a pure refactor."""
     if not bf16_scoring:
         q_grouped = q_grouped.to(torch.float32)
         k_ctx_heads = k_ctx_heads.to(torch.float32)
@@ -31,7 +42,7 @@ def _magnet_alpha_block(
         "qkgd,nkd->kgqn", q_grouped, k_ctx_heads,
     ) * scale
     probs = torch.softmax(logits.float(), dim=-1)
-    return probs.sum(dim=2).mean(dim=(0, 1))
+    return probs.mean(dim=(0, 1, 2))
 
 class LMCBaseModel(nn.Module, ABC):
     def __init__(
@@ -292,6 +303,16 @@ class LMCBaseModel(nn.Module, ABC):
             v_view = v_full.view(context_len + Q_s, num_kv_heads, head_dim)
             q_h = q.view(Q_s, num_heads, head_dim)
 
+            _layer_sw = getattr(
+                self.vllm_attn_layers[idx].impl, "sliding_window", None,
+            )
+            if _layer_sw is None or (
+                isinstance(_layer_sw, tuple) and _layer_sw[0] < 0
+            ):
+                _window_size = (-1, -1)
+            else:
+                _window_size = (int(_layer_sw[0]), int(_layer_sw[1]))
+
             attn_out = flash_attn_varlen_func(
                 q=q_h,
                 k=k_view,
@@ -302,6 +323,7 @@ class LMCBaseModel(nn.Module, ABC):
                 max_seqlen_k=context_len + Q_s,
                 softmax_scale=scale,
                 causal=True,
+                window_size=_window_size,
             )
             attn_out = attn_out.reshape(Q_s, num_heads * head_dim).to(q.dtype)
 

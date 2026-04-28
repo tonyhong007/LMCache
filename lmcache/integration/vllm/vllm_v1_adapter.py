@@ -5,6 +5,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+import logging
 import os
 import threading
 import time
@@ -50,6 +51,7 @@ from lmcache.v1.compute.blend.incremental_strategy import (
     IncrementalBlendStrategy,
     LayerWiseIncrementalBlendStrategy,
     MagnetIncrementalBlendStrategy,
+    MagnetIncrementalPrefillStrategy,
     TokenWiseIncrementalBlendStrategy,
     build_incremental_blend_strategy,
 )
@@ -76,6 +78,25 @@ if TYPE_CHECKING:
     from lmcache.v1.lookup_client.abstract_client import LookupClientInterface
 
 logger = init_logger(__name__)
+
+
+def _emit_magnet_selection_event(event: dict) -> None:
+    """Append one JSON event to $SAGE_MAGNET_SELECTION_LOG_FILE, one per
+    line. Used by external benchmarks to attribute per-request selection
+    ratios (especially entropy mode, where the ratio is data-dependent).
+    No-op when the env var is unset. Writes must cross the EngineCore
+    subprocess → disk; atomic per-line append is fine for single-worker
+    benches.
+    """
+    import json as _json, os as _os
+    path = _os.environ.get("SAGE_MAGNET_SELECTION_LOG_FILE")
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            f.write(_json.dumps(event) + "\n")
+    except Exception:
+        pass
 
 
 def _normalize_ratio(value: float) -> float:
@@ -483,6 +504,7 @@ class SageMethod(str, Enum):
     CACHEBLEND_TOKENWISE = "cacheblend-tokenwise"
     CACHEBLEND_LAYERWISE = "cacheblend-layerwise"
     MAGNET = "magnet"                      # query-aware adaptive (ProphetKV-style)
+    MAGNET_INCREMENTAL = "magnet-incremental"  # magnet scoring + amortized recompute
 
 
 class LMCacheConnectorV1Impl:
@@ -598,6 +620,8 @@ class LMCacheConnectorV1Impl:
             self._sage_method = SageMethod.CACHEBLEND_LAYERWISE
         elif isinstance(self._incremental_blend_strategy, TokenWiseIncrementalBlendStrategy):
             self._sage_method = SageMethod.CACHEBLEND_TOKENWISE
+        elif isinstance(self._incremental_blend_strategy, MagnetIncrementalPrefillStrategy):
+            self._sage_method = SageMethod.MAGNET_INCREMENTAL
         elif isinstance(self._incremental_blend_strategy, MagnetIncrementalBlendStrategy):
             self._sage_method = SageMethod.MAGNET
         else:
@@ -895,6 +919,29 @@ class LMCacheConnectorV1Impl:
 
     def _cleanup_sage_incremental_state(self, req_id: str) -> None:
         state = self._sage_incremental_states.pop(req_id, None)
+        # Env-gated decode-time profile summary — logged here so we emit
+        # exactly once per request, right before its state is freed.
+        if (
+            state is not None
+            and os.environ.get("SAGE_MAGNET_DECODE_PROFILE", "0") == "1"
+        ):
+            score_s = float(getattr(state, "_magnet_prof_score_s", 0.0))
+            score_n = int(getattr(state, "_magnet_prof_score_n", 0))
+            fi_setup_s = float(getattr(state, "_magnet_prof_fi_setup_s", 0.0))
+            fi_n = int(getattr(state, "_magnet_prof_fi_n", 0))
+            fi_m_sum = int(getattr(state, "_magnet_prof_fi_m_sum", 0))
+            total_disc = int(getattr(
+                state, "_magnet_dynamic_total_discovered", 0,
+            ))
+            ctx_len = int(getattr(state, "_magnet_dynamic_ctx_len", 0))
+            logger.info(
+                "[SAGE_MAGNET_DECODE_PROFILE] req=%s "
+                "ctx_len=%d score_events=%d score_s=%.3f "
+                "fi_events=%d fi_setup_s=%.3f fi_m_sum=%d "
+                "total_discovered=%d",
+                req_id, ctx_len, score_n, score_s,
+                fi_n, fi_setup_s, fi_m_sum, total_disc,
+            )
         self._sage_pending_blend_launch_t0.pop(req_id, None)
         self._sage_cached_prompt_inputs.pop(req_id, None)
         LMCacheConnectorV1Impl._shared_early_blend_done.pop(req_id, None)
@@ -902,6 +949,14 @@ class LMCacheConnectorV1Impl:
         self._sage_incremental_completed_requests.discard(req_id)
         self._fused_inject_pending.pop(req_id, None)
         self._fused_inject_active.discard(req_id)
+        # Clear Q ring buffer so the next request starts with fresh Qs
+        # (the buffer is adapter-global; without clearing, a new
+        # request's first few scored events would mix in the previous
+        # request's decode Qs).
+        _q_win = getattr(self, "_magnet_dynamic_q_window_per_layer", None)
+        if _q_win is not None:
+            for _lid in list(_q_win.keys()):
+                _q_win[_lid].clear()
 
     def _mark_sage_recompute_completed(
         self,
@@ -966,6 +1021,23 @@ class LMCacheConnectorV1Impl:
         result_np = actual_block_id * block_size + pos_in_block
 
         return torch.from_numpy(result_np).to(device=device, dtype=torch.int64)
+
+    def _assert_rope_adjusted(self, req_id: str, context: str) -> None:
+        """Guard any blend/recompute entry against a stale layer-0 K.
+
+        Sage intentionally does NOT write back recomputed K/V at layer 0;
+        correctness relies on _run_rope_prepass_and_remap having already
+        rewritten the paged cache's layer-0 K to absolute-position RoPE
+        for this request. If rope remap was silently skipped, layer 0's
+        attention runs against local-position K and hidden states drift
+        from layer 1 onward. This guard catches that silent divergence.
+        """
+        assert req_id in self._sage_rope_adjusted_requests, (
+            f"[SAGE] blend path '{context}' invoked for {req_id} before "
+            f"rope_prepass_and_remap completed — layer-0 K may still have "
+            f"local-position RoPE, which silently corrupts all subsequent "
+            f"layers. Fix: ensure the rope-prepass block ran for this req."
+        )
 
     def _run_rope_prepass_and_remap(
         self,
@@ -1093,6 +1165,7 @@ class LMCacheConnectorV1Impl:
             max(_check_layers) + 1 if pre_ttft_ratio == 0
             else self.blender.num_layers
         )
+        self._assert_rope_adjusted(req_id, "tokenwise_pre_ttft")
         self.blender.blend_from_gpu(
             blend_tokens,
             sage_token_mask,
@@ -1223,17 +1296,64 @@ class LMCacheConnectorV1Impl:
             gpu_connector=self.blender.gpu_connector,
         )
 
+        # ── TP fix: magnet_query_only_score reduces over LOCAL KV-head
+        # shards only. At TP > 1 each rank produces a different
+        # fused_alpha because each rank holds different heads. Without an
+        # all-reduce, each rank then runs an independent topk and selects
+        # different token indices, so Pass 2 slices Q/K/V at different
+        # rows on each rank -> incoherent cross-attention -> accuracy
+        # collapse. SUM across ranks gives every rank the same global
+        # alpha signal so topk picks identical indices everywhere.
+        try:
+            from vllm.distributed import (
+                get_tensor_model_parallel_world_size,
+                get_tp_group,
+            )
+            _tp_world = get_tensor_model_parallel_world_size()
+        except Exception:
+            _tp_world = 1
+        if _tp_world > 1:
+            try:
+                import torch.distributed as _dist
+                _tp_group = get_tp_group().device_group
+                _dist.all_reduce(fused_alpha, op=_dist.ReduceOp.SUM,
+                                 group=_tp_group)
+                # Normalize: each rank's per-token alpha is a mean over
+                # its LOCAL KV heads. Summing N ranks gives N * (TP=1
+                # alpha). Divide by world_size to keep absolute alpha
+                # values comparable to TP=1 — matters for threshold
+                # selection mode (and any future code that reads alpha
+                # absolutely instead of via topk).
+                fused_alpha.div_(_tp_world)
+            except Exception as _e:
+                logger.warning(
+                    "[SAGE_TP_FIX] all_reduce failed (%s); proceeding "
+                    "with per-rank fused_alpha (results will be wrong)",
+                    _e,
+                )
+
         selected: Optional[torch.Tensor] = None
-        # Apply candidate mask (first-chunk exclusion).
+        _candidate_indices: Optional[torch.Tensor] = None
+        _effective_len = int(ctx_len)
         if (
             sage_token_mask is not None
             and sage_token_mask.numel() >= ctx_len
         ):
             ctx_mask = sage_token_mask[:ctx_len].to(device)
             fused_alpha = fused_alpha.masked_fill(~ctx_mask, 0.0)
+            _candidate_indices = torch.nonzero(
+                ctx_mask, as_tuple=False
+            ).flatten()
+            _effective_len = int(_candidate_indices.numel())
 
-        # Log quantile distribution for threshold tuning.
-        if fused_alpha.numel() > 0:
+        # Log quantile distribution for threshold tuning. Env-gated
+        # because the sort + ~10 `.item()` calls each force a GPU sync
+        # and noticeably slow the pre-TTFT path; only enable when
+        # actively calibrating SAGE_MAGNET_THRESHOLD.
+        if (
+            fused_alpha.numel() > 0
+            and os.environ.get("SAGE_MAGNET_LOG_QUANTILES", "0") == "1"
+        ):
             _fs, _ = torch.sort(fused_alpha, descending=True)
             _n = _fs.numel()
             _qs = [0.01, 0.05, 0.10, 0.20, 0.30, 0.50, 0.80]
@@ -1271,30 +1391,99 @@ class LMCacheConnectorV1Impl:
                 os.environ.get("SAGE_MAGNET_TOPK_RATIO", "0.15")
             )
             _k = max(1, int(round(ctx_len * _topk_ratio)))
-            _k = min(_k, int(fused_alpha.numel()))
-            _topk_result = torch.topk(fused_alpha, k=_k)
-            _topk_idx = _topk_result.indices
-            _topk_vals = _topk_result.values
+            _k = min(_k, _effective_len)
+            if _candidate_indices is not None:
+                _local = torch.topk(fused_alpha[_candidate_indices], k=_k)
+                _topk_idx = _candidate_indices[_local.indices]
+            else:
+                _topk_idx = torch.topk(fused_alpha, k=_k).indices
             context_selected, _ = torch.sort(_topk_idx)
-            # Diagnostic: log top-10 selected indices and their α scores
-            # so we can correlate with the needle position.
-            _top10 = torch.topk(fused_alpha, k=min(10, int(fused_alpha.numel())))
-            _top10_idx = _top10.indices.cpu().tolist()
-            _top10_vals = [round(v, 4) for v in _top10.values.cpu().tolist()]
-            logger.info(
-                "[SAGE_MAGNET] selection_mode=topk k=%d ratio=%.4f "
-                "top10_idx=%s top10_alpha=%s ctx_len=%d",
-                _k, _topk_ratio, _top10_idx, _top10_vals, ctx_len,
+            _emit_magnet_selection_event({
+                "mode": "topk", "req_id": req_id,
+                "k": int(_k), "ctx_len": int(ctx_len),
+                "topk_ratio": float(_topk_ratio),
+            })
+        elif _sel_mode == "entropy":
+            # Entropy-adaptive budgeting: normalize α to a probability
+            # distribution p. Use Rényi-α entropy with α=0.5:
+            #   H_{0.5}(p) = 2 · log(Σ √p_i)
+            #   n = exp(H_{0.5}) = (Σ √p_i)²
+            # Rényi-0.5 gives more weight to the tail than Shannon (α=1),
+            # inflating the effective support for diffuse-attention tasks
+            # while still collapsing to a small budget on peaky ones.
+            _alpha_order = float(os.environ.get(
+                "SAGE_MAGNET_ENTROPY_ORDER", "0.5",
+            ))
+            _alpha_pos = torch.clamp(fused_alpha, min=0.0)
+            _p = _alpha_pos / (_alpha_pos.sum() + 1e-12)
+            if abs(_alpha_order - 1.0) < 1e-6:
+                # Shannon fallback
+                _eps = 1e-12
+                _H = float(-(torch.where(_p > 0, _p * torch.log(_p + _eps),
+                                         torch.zeros_like(_p))).sum())
+            else:
+                # Rényi-α: H_α = 1/(1-α) · log(Σ p_i^α)
+                _sum_pa = float(torch.pow(_p + 1e-20, _alpha_order).sum())
+                import math as _math
+                _H = _math.log(_sum_pa) / (1.0 - _alpha_order)
+            import math as _math
+            _n = int(round(_math.exp(_H)))
+            _k = max(1, min(_n, _effective_len))
+            # Optional cap (same semantic as threshold mode)
+            _max_ratio = float(os.environ.get("SAGE_MAGNET_MAX_RATIO", "0"))
+            _pre_cap = _k
+            if _max_ratio > 0:
+                _k = min(_k, max(1, int(_max_ratio * ctx_len)))
+            if _candidate_indices is not None:
+                _local = torch.topk(fused_alpha[_candidate_indices], k=_k)
+                context_selected, _ = torch.sort(
+                    _candidate_indices[_local.indices]
+                )
+            else:
+                _topk_result = torch.topk(fused_alpha, k=_k)
+                context_selected, _ = torch.sort(_topk_result.indices)
+            logger.debug(
+                "[SAGE_MAGNET] selection_mode=entropy order=%.3f H=%.4f "
+                "exp_H=%d k=%d/%d (pre_cap=%d, max_ratio=%.3f) ctx_len=%d",
+                _alpha_order, _H, _n, _k, int(fused_alpha.numel()),
+                _pre_cap, _max_ratio, ctx_len,
             )
+            _emit_magnet_selection_event({
+                "mode": "entropy", "req_id": req_id,
+                "k": int(_k), "ctx_len": int(ctx_len),
+                "alpha_order": float(_alpha_order),
+                "renyi_entropy": float(_H),
+            })
         else:
             context_selected = torch.nonzero(
                 fused_alpha > threshold, as_tuple=False
             ).flatten()
-            logger.info(
-                "[SAGE_MAGNET] selection_mode=threshold p=%.4f "
-                "selected=%d/%d",
-                threshold, int(context_selected.numel()), ctx_len,
+            # Optional cap: if threshold selects more than MAX_RATIO of
+            # context, keep only the top MAX_RATIO * ctx_len by alpha
+            # (highest-α tokens). Prevents over-recompute on samples
+            # with diffuse α distributions while preserving adaptive
+            # behavior on peaked-α samples.
+            _max_ratio = float(
+                os.environ.get("SAGE_MAGNET_MAX_RATIO", "0")
             )
+            _pre_cap_count = int(context_selected.numel())
+            if _max_ratio > 0 and _pre_cap_count > _max_ratio * ctx_len:
+                _max_k = max(1, int(_max_ratio * ctx_len))
+                _sel_alphas = fused_alpha[context_selected]
+                _top_local = torch.topk(_sel_alphas, k=_max_k).indices
+                context_selected = context_selected[_top_local]
+                context_selected, _ = torch.sort(context_selected)
+            logger.debug(
+                "[SAGE_MAGNET] selection_mode=threshold p=%.4f "
+                "selected=%d/%d (pre_cap=%d, max_ratio=%.3f)",
+                threshold, int(context_selected.numel()), ctx_len,
+                _pre_cap_count, _max_ratio,
+            )
+            _emit_magnet_selection_event({
+                "mode": "threshold", "req_id": req_id,
+                "k": int(context_selected.numel()), "ctx_len": int(ctx_len),
+                "threshold": float(threshold),
+            })
         suffix_indices = torch.arange(
             ctx_len, N, device=device, dtype=torch.long,
         )
@@ -1309,6 +1498,7 @@ class LMCacheConnectorV1Impl:
                 device=device, dtype=torch.long,
             )
             try:
+                self._assert_rope_adjusted(req_id, "magnet_pre_ttft")
                 self.blender.blend_from_gpu(
                     blend_tokens,
                     sage_token_mask,
@@ -1331,27 +1521,556 @@ class LMCacheConnectorV1Impl:
             state.decode_step = 0
             state.query_token_count = suffix_len
 
-        imp_mean = (
-            float(fused_alpha.mean().item())
-            if fused_alpha is not None and fused_alpha.numel() > 0 else 0.0
-        )
-        imp_max = (
-            float(fused_alpha.max().item())
-            if fused_alpha is not None and fused_alpha.numel() > 0 else 0.0
-        )
-        logger.info(
-            "[SAGE_MAGNET] request=%s pre-TTFT complete (ProphetKV 2-pass): "
-            "N=%d suffix=%d selected=%d threshold=%.6f "
-            "mean_fused=%.6f max_fused=%.6f",
-            req_id, N, suffix_len, selected_count,
-            threshold, imp_mean, imp_max,
+        # ── Dynamic-discovery setup (env-gated; pure-magnet path) ──
+        # When SAGE_MAGNET_DYNAMIC_DISCOVERY=1 we keep the request
+        # active so the decode-step handler can fire scoring after
+        # each forward and queue newly-discovered anchors for fused
+        # inject. The pre-TTFT-selected anchor set becomes the
+        # "already recomputed" filter so we only surface NEW ones.
+        _dyn_on = os.environ.get("SAGE_MAGNET_DYNAMIC_DISCOVERY", "0") == "1"
+        if _dyn_on and state is not None and selected_count > 0:
+            self._ensure_magnet_dynamic_discovery_hooks_registered()
+            # Context slot mapping: everything except the suffix.
+            _ctx_slot_mapping = blend_slot_mapping[:ctx_len].clone()
+            state._magnet_dynamic_ctx_slot_mapping = _ctx_slot_mapping
+            state._magnet_dynamic_ctx_len = int(ctx_len)
+            # `selected` includes both context anchors AND suffix indices.
+            # For the dedup filter we only care about CONTEXT entries.
+            state._magnet_dynamic_pre_ttft_set = set(
+                int(x) for x in selected.tolist() if int(x) < ctx_len
+            )
+            state._magnet_dynamic_cumul_set = set()
+            state._magnet_dynamic_total_discovered = 0
+            state._magnet_dynamic_threshold = float(threshold)
+            state.decode_step = max(state.decode_step, 1)
+            state.query_token_count = suffix_len
+            logger.info(
+                "[SAGE_MAGNET_DYNAMIC] req=%s setup: "
+                "ctx_len=%d pre_ttft_anchors=%d threshold=%.6f",
+                req_id, ctx_len,
+                len(state._magnet_dynamic_pre_ttft_set), threshold,
+            )
+            # Do NOT mark completed — decode-step handler will fire.
+        else:
+            # Mark completed from the incremental-blend scheduler's perspective
+            # so it doesn't re-enter start_load_kv. Decode-time recomputation
+            # happens entirely via the hook + fused-inject pipeline, not via
+            # scheduler-triggered blend passes.
+            logger.info("[SAGE_COMPLETED_TRACE] req=%s site=L1560", req_id)
+            self._sage_incremental_completed_requests.add(req_id)
+
+    def _run_magnet_incremental_pre_ttft(
+        self,
+        req_id: str,
+        blend_tokens: torch.Tensor,
+        sage_token_mask: torch.Tensor,
+        blend_slot_mapping: torch.Tensor,
+        blend_block_table: Optional[torch.Tensor],
+        kvcaches: list,
+        sage_zero_copy: bool,
+        state: Any,
+        suffix_len: int = 0,
+        chunk_boundaries: Optional[list[int]] = None,
+    ) -> None:
+        """Magnet-incremental-prefill pre-TTFT: scoring + partial recompute.
+
+        Same Pass 1 as pure magnet (``magnet_query_only_score``), but
+        Pass 2 only recomputes the top ``pre_ttft_ratio`` fraction of
+        the anchor set (ordered by descending alpha). Remaining
+        anchors are frozen in state.frozen_importance_ranking for
+        decode-step amortized recompute (wired up in Phase 2).
+        """
+        strategy = self._incremental_blend_strategy
+        threshold = getattr(strategy, "threshold", 0.08)
+        pre_ttft_ratio = getattr(strategy, "pre_ttft_ratio", 0.5)
+
+        N = int(blend_tokens.shape[0])
+        ctx_len = N - suffix_len
+        device = blend_tokens.device
+
+        if suffix_len <= 0 or ctx_len <= 0:
+            logger.info(
+                "[SAGE_MAGNET_INC] request=%s pre-TTFT skip: "
+                "suffix_len=%d ctx_len=%d",
+                req_id, suffix_len, ctx_len,
+            )
+            if state is not None:
+                state.decode_step = 0
+                state.query_token_count = suffix_len
+            logger.info("[SAGE_COMPLETED_TRACE] req=%s site=L1600", req_id)
+            self._sage_incremental_completed_requests.add(req_id)
+            return
+
+        # ── Pass 1: magnet query-aware scoring (same as pure magnet) ──
+        query_tokens = blend_tokens[ctx_len:].to(device)
+        context_slot_mapping = blend_slot_mapping[:ctx_len]
+        fused_alpha = self.blender.layerwise_model.magnet_query_only_score(
+            query_token_ids=query_tokens,
+            context_slot_mapping=context_slot_mapping,
+            context_len=ctx_len,
+            query_position_start=ctx_len,
+            kvcaches=kvcaches,
+            gpu_connector=self.blender.gpu_connector,
         )
 
-        # Mark completed from the incremental-blend scheduler's perspective
-        # so it doesn't re-enter start_load_kv. Decode-time recomputation
-        # happens entirely via the hook + fused-inject pipeline, not via
-        # scheduler-triggered blend passes.
-        self._sage_incremental_completed_requests.add(req_id)
+        if sage_token_mask is not None and sage_token_mask.numel() >= ctx_len:
+            ctx_mask = sage_token_mask[:ctx_len].to(device)
+            fused_alpha = fused_alpha.masked_fill(~ctx_mask, 0.0)
+
+        # Identify anchor set S. Supports two selection modes (matching
+        # the pure-magnet path for consistency): threshold (adaptive)
+        # and topk (fixed fraction).
+        _sel_mode = os.environ.get(
+            "SAGE_MAGNET_SELECTION_MODE", "threshold",
+        ).strip().lower()
+        if _sel_mode == "topk":
+            _topk_ratio = float(
+                os.environ.get("SAGE_MAGNET_TOPK_RATIO", "0.20")
+            )
+            _k = max(1, int(round(ctx_len * _topk_ratio)))
+            _k = min(_k, int(fused_alpha.numel()))
+            anchor_indices = torch.topk(
+                fused_alpha, k=_k,
+            ).indices.to(torch.long)
+            logger.info(
+                "[SAGE_MAGNET_INC] selection_mode=topk k=%d ratio=%.4f "
+                "ctx_len=%d",
+                _k, _topk_ratio, ctx_len,
+            )
+        elif _sel_mode == "entropy":
+            # Entropy-adaptive budget (Rényi-α). Mirrors pure magnet path.
+            _alpha_order = float(os.environ.get(
+                "SAGE_MAGNET_ENTROPY_ORDER", "0.70",
+            ))
+            _alpha_pos = torch.clamp(fused_alpha, min=0.0)
+            _p = _alpha_pos / (_alpha_pos.sum() + 1e-12)
+            if abs(_alpha_order - 1.0) < 1e-6:
+                _eps = 1e-12
+                _H = float(-(torch.where(
+                    _p > 0, _p * torch.log(_p + _eps),
+                    torch.zeros_like(_p),
+                )).sum())
+            else:
+                import math as _math_inc
+                _sum_pa = float(torch.pow(
+                    _p + 1e-20, _alpha_order,
+                ).sum())
+                _H = _math_inc.log(_sum_pa) / (1.0 - _alpha_order)
+            import math as _math_inc
+            _n = int(round(_math_inc.exp(_H)))
+            _k = max(1, min(_n, int(fused_alpha.numel())))
+            _max_ratio = float(
+                os.environ.get("SAGE_MAGNET_MAX_RATIO", "0")
+            )
+            _pre_cap = _k
+            if _max_ratio > 0:
+                _k = min(_k, max(1, int(_max_ratio * ctx_len)))
+            anchor_indices = torch.topk(
+                fused_alpha, k=_k,
+            ).indices.to(torch.long)
+            logger.info(
+                "[SAGE_MAGNET_INC] selection_mode=entropy order=%.3f "
+                "H=%.4f exp_H=%d k=%d/%d (pre_cap=%d, max_ratio=%.3f) "
+                "ctx_len=%d",
+                _alpha_order, _H, _n, _k, int(fused_alpha.numel()),
+                _pre_cap, _max_ratio, ctx_len,
+            )
+        else:
+            anchor_mask = fused_alpha > threshold
+            anchor_indices = torch.nonzero(
+                anchor_mask, as_tuple=False,
+            ).flatten()
+            # Optional cap (same logic as pure magnet path).
+            _max_ratio = float(
+                os.environ.get("SAGE_MAGNET_MAX_RATIO", "0")
+            )
+            _pre_cap = int(anchor_indices.numel())
+            if _max_ratio > 0 and _pre_cap > _max_ratio * ctx_len:
+                _max_k = max(1, int(_max_ratio * ctx_len))
+                _sel_alphas = fused_alpha[anchor_indices]
+                _top_local = torch.topk(_sel_alphas, k=_max_k).indices
+                anchor_indices = anchor_indices[_top_local].to(torch.long)
+                anchor_indices, _ = torch.sort(anchor_indices)
+            logger.info(
+                "[SAGE_MAGNET_INC] selection_mode=threshold p=%.6f "
+                "selected=%d/%d (pre_cap=%d, max_ratio=%.3f)",
+                threshold, int(anchor_indices.numel()), ctx_len,
+                _pre_cap, _max_ratio,
+            )
+
+        if anchor_indices.numel() == 0:
+            logger.info(
+                "[SAGE_MAGNET_INC] request=%s pre-TTFT: no anchors "
+                "above threshold=%.6f. Falling through to suffix-only "
+                "recompute.",
+                req_id, threshold,
+            )
+            # Still need to run suffix-only blend path to ensure the
+            # decode query tokens are recomputed.
+            suffix_indices = torch.arange(
+                ctx_len, N, device=device, dtype=torch.long,
+            )
+            self.blender.metadata.magnet_preselected_indices = (
+                suffix_indices.to(device=device, dtype=torch.long)
+            )
+            try:
+                self._assert_rope_adjusted(req_id, "magnet_incremental_suffix_only")
+                self.blender.blend_from_gpu(
+                    blend_tokens,
+                    sage_token_mask,
+                    step_recompute_ratio=None,
+                    capture_full_ranking=False,
+                    save_boundary=False,
+                    suffix_len=suffix_len,
+                    include_suffix=True,
+                    kvcaches=kvcaches,
+                    slot_mapping=blend_slot_mapping,
+                    block_table=blend_block_table,
+                    sage_zero_copy=sage_zero_copy,
+                )
+            finally:
+                self.blender.metadata.magnet_preselected_indices = None
+            if state is not None:
+                state.cumulative_ratio = 1.0  # no anchors -> budget done
+                state.pre_ttft_recomputed_tokens = 0
+                state.decode_step = 0
+                state.query_token_count = suffix_len
+            logger.info("[SAGE_COMPLETED_TRACE] req=%s site=L1737", req_id)
+            self._sage_incremental_completed_requests.add(req_id)
+            return
+
+        # Rank anchors by alpha descending.
+        anchor_alphas = fused_alpha[anchor_indices]
+        sorted_order = torch.argsort(anchor_alphas, descending=True)
+        ranked_anchors = anchor_indices[sorted_order].to(torch.long)
+
+        n_anchors = int(ranked_anchors.numel())
+        pre_ttft_count = max(1, int(round(n_anchors * pre_ttft_ratio)))
+        pre_ttft_count = min(pre_ttft_count, n_anchors)
+        pre_ttft_slice = ranked_anchors[:pre_ttft_count]
+        remaining_slice = ranked_anchors[pre_ttft_count:]
+
+        # ── Pass 2: recompute pre-TTFT slice + suffix ──
+        suffix_indices = torch.arange(
+            ctx_len, N, device=device, dtype=torch.long,
+        )
+        selected = torch.cat([pre_ttft_slice, suffix_indices])
+        selected = torch.unique(selected, sorted=True)
+
+        self.blender.metadata.magnet_preselected_indices = selected.to(
+            device=device, dtype=torch.long,
+        )
+        try:
+            self._assert_rope_adjusted(req_id, "magnet_incremental_pre_ttft")
+            self.blender.blend_from_gpu(
+                blend_tokens,
+                sage_token_mask,
+                step_recompute_ratio=None,
+                capture_full_ranking=False,
+                save_boundary=False,
+                suffix_len=suffix_len,
+                include_suffix=True,
+                kvcaches=kvcaches,
+                slot_mapping=blend_slot_mapping,
+                block_table=blend_block_table,
+                sage_zero_copy=sage_zero_copy,
+            )
+        finally:
+            self.blender.metadata.magnet_preselected_indices = None
+
+        # Freeze remaining ranking in state for decode-step driver.
+        # cumulative_ratio tracks fraction of ANCHOR SET |S| processed
+        # (strategy semantics). Driver has a branch to use |S| instead
+        # of N when computing tokens_per_step and cumulative_ratio
+        # updates for MAGNET_INCREMENTAL.
+        if state is not None:
+            state.frozen_importance_ranking = remaining_slice
+            state.frozen_ratio_cursor = 0.0
+            state.cumulative_ratio = float(pre_ttft_ratio)
+            state.pre_ttft_recomputed_tokens = pre_ttft_count
+            state.decode_step = max(state.decode_step, 1)
+            state.query_token_count = suffix_len
+            # Reuse tokenwise driver fields.
+            state._tw_cursor = 0
+            state._tw_tokens_emitted = 0
+            state._tw_prev_ratio = float(pre_ttft_ratio)
+
+        # If there's no remaining work, mark completed so the decode
+        # scheduler doesn't re-enter. Otherwise, leave uncompleted so
+        # the tokenwise-style decode-step driver consumes
+        # state.frozen_importance_ranking across subsequent steps.
+        if remaining_slice.numel() == 0:
+            logger.info("[SAGE_COMPLETED_TRACE] req=%s site=L1809", req_id)
+            self._sage_incremental_completed_requests.add(req_id)
+
+        # ── Dynamic-discovery setup (env-gated, magnet-incremental only) ──
+        # Stage per-request context so the decode-step handler can score
+        # captured Q against this request's context K at each step.
+        if os.environ.get("SAGE_MAGNET_DYNAMIC_DISCOVERY", "0") == "1":
+            self._ensure_magnet_dynamic_discovery_hooks_registered()
+            if state is not None:
+                state._magnet_dynamic_ctx_slot_mapping = (
+                    blend_slot_mapping[:ctx_len].clone()
+                )
+                state._magnet_dynamic_ctx_len = int(ctx_len)
+                # Union of pre-TTFT recomputed context indices (anchors
+                # only; suffix tokens are a separate set).
+                state._magnet_dynamic_pre_ttft_set = set(
+                    int(x) for x in pre_ttft_slice.tolist()
+                )
+                state._magnet_dynamic_cumul_set = set()
+                state._magnet_dynamic_total_discovered = 0
+                state._magnet_dynamic_threshold = float(threshold)
+
+    def _ensure_magnet_dynamic_discovery_hooks_registered(self) -> None:
+        """Register per-layer forward_pre_hooks on self_attn.attn to
+        capture the post-RoPE Q tensor for the single decode token.
+
+        Gated by SAGE_MAGNET_DYNAMIC_DISCOVERY=1. Idempotent — hooks are
+        registered exactly once per adapter lifetime. Hooks fire for ALL
+        requests (not just magnet-incremental), but the ~0.5KB/layer
+        tensor reference is negligible when not consumed.
+
+        Hook filters by shape[0] == 1 so only decode forward passes are
+        captured (not chunk prefill or pre-TTFT query-only forward which
+        have larger query dimensions).
+        """
+        if getattr(self, "_magnet_dynamic_hooks_registered", False):
+            return
+        # q_per_layer holds the LATEST captured Q per layer (single tensor).
+        # q_window_per_layer holds a ring buffer of recent Qs for sliding-
+        # window aggregation (when SAGE_MAGNET_DECODE_WINDOW > 1).
+        if not hasattr(self, "_magnet_dynamic_q_per_layer"):
+            self._magnet_dynamic_q_per_layer: dict[int, torch.Tensor] = {}
+        if not hasattr(self, "_magnet_dynamic_q_window_per_layer"):
+            self._magnet_dynamic_q_window_per_layer: dict[int, list] = {}
+
+        try:
+            lmc_model = self.blender.layerwise_model
+            vllm_model = lmc_model.vllm_model
+            layers = vllm_model.model.layers
+        except Exception as e:
+            logger.warning(
+                "[SAGE_MAGNET_DYNAMIC] could not access model layers: %s", e,
+            )
+            return
+
+        def make_pre_hook(layer_idx):
+            def _hook(module, args, kwargs=None):
+                # self_attn.attn is called as attn(q, k, v, kv_cache, attn_metadata)
+                # args[0] is Q (post-RoPE), shape [num_tokens, num_heads * head_dim]
+                # or [num_tokens, num_heads, head_dim] depending on the backend.
+                try:
+                    q = args[0]
+                    if q.shape[0] == 1:
+                        _qd = q.detach()
+                        self._magnet_dynamic_q_per_layer[layer_idx] = _qd
+                        # Sliding-window buffer: only populated when the
+                        # window env var is > 1. Size-bounded by trimming
+                        # to the last W entries.
+                        try:
+                            _w = int(os.environ.get(
+                                "SAGE_MAGNET_DECODE_WINDOW", "1",
+                            ))
+                        except Exception:
+                            _w = 1
+                        if _w > 1:
+                            buf = self._magnet_dynamic_q_window_per_layer.setdefault(
+                                layer_idx, []
+                            )
+                            buf.append(_qd)
+                            if len(buf) > _w:
+                                del buf[: len(buf) - _w]
+                except Exception:
+                    pass
+                return None
+            return _hook
+
+        self._magnet_dynamic_hook_handles = []
+        for L, layer in enumerate(layers):
+            try:
+                attn_mod = layer.self_attn.attn
+                h = attn_mod.register_forward_pre_hook(make_pre_hook(L))
+                self._magnet_dynamic_hook_handles.append(h)
+            except Exception as e:
+                logger.warning(
+                    "[SAGE_MAGNET_DYNAMIC] layer %d hook failed: %s", L, e,
+                )
+        self._magnet_dynamic_hooks_registered = True
+        logger.info(
+            "[SAGE_MAGNET_DYNAMIC] registered %d Q-capture hooks",
+            len(self._magnet_dynamic_hook_handles),
+        )
+
+    def _compute_magnet_dynamic_alpha(
+        self,
+        state: Any,
+        kvcaches: list,
+    ) -> Optional["torch.Tensor"]:
+        """Compute ProphetKV fused α using the Q's captured by hooks
+        during the most recent decode forward.
+
+        Returns a `[ctx_len]` tensor of α scores (normalized across
+        scored layers, softmax-in-heads), or None if hooks haven't
+        populated the required layers yet.
+
+        By default this iterates every layer (same as pre-TTFT
+        scoring). Set SAGE_MAGNET_DECODE_SCORE_LAYERS to a
+        comma-separated list of 0-indexed layer ids (e.g. "0" or
+        "0,1,2") to score only a subset. Scoring a single early layer
+        cuts per-decode-step scoring cost from O(num_layers) KV
+        transfers + einsums down to O(1), trading some accuracy for
+        decode latency — useful for amortizing incremental discovery
+        over long generations.
+
+        Mirrors the math in `magnet_query_only_score` (base.py) but
+        with a single decode query.
+        """
+        import math
+        import lmcache.c_ops as _lmc_ops
+        from lmcache.v1.compute.models.base import _magnet_alpha_block
+
+        q_per_layer = getattr(self, "_magnet_dynamic_q_per_layer", None)
+        if not q_per_layer:
+            return None
+        # Sliding-window aggregation: if SAGE_MAGNET_DECODE_WINDOW > 1,
+        # replace each layer's latest Q with the mean over the ring
+        # buffer of recent Qs. Selects tokens that have been
+        # persistently attended to across the recent decode window
+        # instead of whatever the latest decode-step Q happened to
+        # look at (reduces momentary-attention noise).
+        try:
+            _window = int(os.environ.get(
+                "SAGE_MAGNET_DECODE_WINDOW", "1",
+            ))
+        except Exception:
+            _window = 1
+        if _window > 1:
+            _q_win = getattr(self, "_magnet_dynamic_q_window_per_layer", {})
+            _aggregated: dict[int, torch.Tensor] = {}
+            for _lid, _buf in _q_win.items():
+                if not _buf:
+                    continue
+                # Stack and mean along the buffer dim. Each Q is shape
+                # [1, ...], so stacking gives [N, 1, ...] and mean over
+                # dim 0 yields [1, ...] — same shape as a single Q.
+                _aggregated[_lid] = torch.stack(_buf, dim=0).mean(dim=0)
+            if _aggregated:
+                q_per_layer = _aggregated
+        num_layers = self.blender.num_layers
+
+        # Resolve the layer subset to score. Empty/unset/"all" → all
+        # layers (back-compat). Malformed values fall back to all.
+        _layers_env = os.environ.get(
+            "SAGE_MAGNET_DECODE_SCORE_LAYERS", "",
+        ).strip().lower()
+        if _layers_env and _layers_env != "all":
+            try:
+                score_layers = sorted({
+                    int(x) for x in _layers_env.split(",") if x.strip() != ""
+                    and 0 <= int(x) < num_layers
+                })
+                if not score_layers:
+                    score_layers = list(range(num_layers))
+            except ValueError:
+                score_layers = list(range(num_layers))
+        else:
+            score_layers = list(range(num_layers))
+
+        # Only the scored layers need to have been captured.
+        if any(L not in q_per_layer for L in score_layers):
+            return None
+
+        ctx_slot_mapping = getattr(state, "_magnet_dynamic_ctx_slot_mapping", None)
+        ctx_len = int(getattr(state, "_magnet_dynamic_ctx_len", 0) or 0)
+        if ctx_slot_mapping is None or ctx_len <= 0:
+            return None
+
+        # Head config from layer 0 attn impl (constant across layers).
+        lmc_model = self.blender.layerwise_model
+        vimpl0 = lmc_model.vllm_attn_layers[0]
+        num_heads = vimpl0.num_heads
+        num_kv_heads = vimpl0.num_kv_heads
+        head_dim = vimpl0.head_size
+        group_size = num_heads // num_kv_heads
+        scale = 1.0 / math.sqrt(head_dim)
+        bf16_scoring = os.environ.get(
+            "SAGE_MAGNET_BF16_SCORING", "1",
+        ) == "1"
+
+        # Scratch buffer [2, ctx_len + 1, H_kv * D] — reused per layer.
+        device = next(iter(q_per_layer.values())).device
+        kv0 = kvcaches[0]
+        hidden_kv = num_kv_heads * head_dim
+        combined_buf = torch.empty(
+            2, ctx_len + 1, hidden_kv,
+            dtype=kv0.dtype, device=device,
+        )
+        gpu_connector = self.blender.gpu_connector
+
+        accumulated = None
+        for L in score_layers:
+            q_raw = q_per_layer.get(L)
+            if q_raw is None:
+                return None
+            # Flatten any [1, H, D] to [1, H*D] then reshape to grouped form.
+            if q_raw.dim() == 3:
+                q_flat = q_raw.reshape(1, -1)
+            else:
+                q_flat = q_raw
+            if q_flat.shape[-1] != num_heads * head_dim:
+                return None
+            q = q_flat.view(1, num_heads, head_dim)
+
+            # Pull K for this request's context slots into the scratch buf.
+            kv = kvcaches[L]
+            _lmc_ops.single_layer_kv_transfer(
+                combined_buf, kv, ctx_slot_mapping,
+                True, False, gpu_connector.vllm_two_major,
+                gpu_connector.use_mla,
+            )
+            k_ctx_heads = combined_buf[0, :ctx_len].view(
+                ctx_len, num_kv_heads, head_dim,
+            )
+
+            # Grouped-einsum α block (same formula as pre-TTFT).
+            q_grouped = q.view(1, num_kv_heads, group_size, head_dim)
+            alpha_L = _magnet_alpha_block(
+                q_grouped, k_ctx_heads, scale, bf16_scoring,
+            )
+            if accumulated is None:
+                accumulated = alpha_L
+            else:
+                accumulated = accumulated + alpha_L
+
+        result = accumulated / float(len(score_layers))
+
+        # ── TP fix (decode-time): same per-rank-divergence problem as
+        # pre-TTFT scoring. _magnet_alpha_block reduces over LOCAL KV
+        # heads; without an all-reduce each rank computes a different
+        # alpha → independent topk → divergent indices → broken Pass 2
+        # at decode time. SUM across ranks works for our scale-invariant
+        # selection modes (topk and entropy normalize p before use).
+        try:
+            from vllm.distributed import (
+                get_tensor_model_parallel_world_size, get_tp_group,
+            )
+            _tp_world_dy = get_tensor_model_parallel_world_size()
+        except Exception:
+            _tp_world_dy = 1
+        if _tp_world_dy > 1:
+            try:
+                import torch.distributed as _dist
+                _dist.all_reduce(
+                    result, op=_dist.ReduceOp.SUM,
+                    group=get_tp_group().device_group,
+                )
+            except Exception as _e:
+                logger.warning(
+                    "[SAGE_TP_FIX] decode all_reduce failed (%s); "
+                    "per-rank alpha will diverge", _e,
+                )
+        return result
 
     def _run_layerwise_pre_ttft(
         self,
@@ -1381,6 +2100,7 @@ class LMCacheConnectorV1Impl:
         import time as _time
         _t_blend = _time.perf_counter()
         _all_layers_pre_ttft = (pre_ttft_layers >= num_layers)
+        self._assert_rope_adjusted(req_id, "layerwise_pre_ttft")
         self.blender.blend_from_gpu(
             blend_tokens,
             sage_token_mask,
@@ -2415,7 +3135,266 @@ class LMCacheConnectorV1Impl:
                                             self.blender.num_layers,
                                         )
                             elif (
-                                self._sage_method == SageMethod.CACHEBLEND_TOKENWISE
+                                self._sage_method == SageMethod.MAGNET
+                                and not is_pre_ttft_step
+                                and os.environ.get(
+                                    "SAGE_MAGNET_DYNAMIC_DISCOVERY", "0",
+                                ) == "1"
+                                and request.req_id not in self._sage_incremental_completed_requests
+                                and request.req_id not in self._sage_suffix_rerecompute_pending
+                            ):
+                                # Pure magnet with dynamic discovery: after
+                                # each decode forward, score the captured Q
+                                # against context K at every layer, find new
+                                # anchors above threshold that haven't been
+                                # recomputed yet, and queue them for fused
+                                # inject. No quartile schedule — all pre-TTFT
+                                # anchors were already recomputed in Pass 2.
+                                #
+                                # Interval gate: SAGE_MAGNET_DECODE_SCORE_INTERVAL
+                                # (default 1 = every decode step) amortizes the
+                                # per-step scoring cost by running scoring only
+                                # every K steps. Layer gate: handled inside
+                                # _compute_magnet_dynamic_alpha via
+                                # SAGE_MAGNET_DECODE_SCORE_LAYERS.
+                                _score_interval = max(1, int(os.environ.get(
+                                    "SAGE_MAGNET_DECODE_SCORE_INTERVAL", "1",
+                                )))
+                                _dec_step = int(getattr(state, "decode_step", 0) or 0)
+                                # Cumulative-cap short circuit: if the decode
+                                # budget is already saturated, skip the
+                                # expensive scoring pass (hook-captured Q →
+                                # cross-attention over context K across all
+                                # scored layers) altogether.
+                                _max_cumul_pre = float(os.environ.get(
+                                    "SAGE_MAGNET_DECODE_MAX_CUMULATIVE", "0",
+                                ))
+                                _ctx_len_pre = int(getattr(
+                                    state, "_magnet_dynamic_ctx_len", 0,
+                                ) or 0)
+                                _cumul_cur = len(getattr(
+                                    state, "_magnet_dynamic_cumul_set", set(),
+                                ))
+                                _cap_reached = (
+                                    _max_cumul_pre > 0
+                                    and _ctx_len_pre > 0
+                                    and _cumul_cur
+                                    >= int(_max_cumul_pre * _ctx_len_pre)
+                                )
+                                if _cap_reached:
+                                    fused_alpha = None
+                                elif _score_interval > 1 and _dec_step % _score_interval != 0:
+                                    fused_alpha = None
+                                else:
+                                    # Profile the scoring pass if env-gated.
+                                    _prof_on = os.environ.get(
+                                        "SAGE_MAGNET_DECODE_PROFILE", "0",
+                                    ) == "1"
+                                    if _prof_on:
+                                        torch.cuda.synchronize()
+                                        _ts_score_start = time.perf_counter()
+                                    fused_alpha = self._compute_magnet_dynamic_alpha(
+                                        state, kvcaches,
+                                    )
+                                    if _prof_on:
+                                        torch.cuda.synchronize()
+                                        state._magnet_prof_score_s = float(
+                                            getattr(state, "_magnet_prof_score_s", 0.0)
+                                        ) + (time.perf_counter() - _ts_score_start)
+                                        state._magnet_prof_score_n = int(
+                                            getattr(state, "_magnet_prof_score_n", 0)
+                                        ) + 1
+                                # Advance decode_step every call (not just when
+                                # scoring) so the interval gate above actually
+                                # cycles; otherwise decode_step is stuck and
+                                # scoring never happens when interval > 1.
+                                state.decode_step = _dec_step + 1
+                                if fused_alpha is not None:
+                                    # Entropy-adaptive top-k at decode:
+                                    # k_step = exp(H_α(p)) where p is the
+                                    # normalized decode α distribution.
+                                    # Same Rényi order as pre-TTFT for
+                                    # narrative consistency. Then intersect
+                                    # top-k with complement(pre_set ∪
+                                    # cumul_set) to get the *new* tokens
+                                    # this decode query is attending to.
+                                    import math as _math_d
+                                    # Allow a separate α for decode-time
+                                    # discovery; defaults to pre-TTFT α.
+                                    _alpha_order = float(os.environ.get(
+                                        "SAGE_MAGNET_DECODE_ENTROPY_ORDER",
+                                        os.environ.get(
+                                            "SAGE_MAGNET_ENTROPY_ORDER", "0.70",
+                                        ),
+                                    ))
+                                    _alpha_pos = torch.clamp(
+                                        fused_alpha, min=0.0,
+                                    )
+                                    _p_dec = _alpha_pos / (
+                                        _alpha_pos.sum() + 1e-12
+                                    )
+                                    if abs(_alpha_order - 1.0) < 1e-6:
+                                        _eps = 1e-12
+                                        _H_dec = float(-(torch.where(
+                                            _p_dec > 0,
+                                            _p_dec * torch.log(_p_dec + _eps),
+                                            torch.zeros_like(_p_dec),
+                                        )).sum())
+                                    else:
+                                        _sum_pa = float(torch.pow(
+                                            _p_dec + 1e-20, _alpha_order,
+                                        ).sum())
+                                        _H_dec = _math_d.log(_sum_pa) / (
+                                            1.0 - _alpha_order
+                                        )
+                                    _k_step = max(1, min(
+                                        int(round(_math_d.exp(_H_dec))),
+                                        int(fused_alpha.numel()),
+                                    ))
+                                    _pre_set = getattr(
+                                        state, "_magnet_dynamic_pre_ttft_set", set(),
+                                    )
+                                    _cumul_set = getattr(
+                                        state, "_magnet_dynamic_cumul_set", set(),
+                                    )
+                                    _topk_idx = torch.topk(
+                                        fused_alpha, k=_k_step,
+                                    ).indices.tolist()
+                                    _new_positions = [
+                                        int(p) for p in _topk_idx
+                                        if p not in _pre_set
+                                        and p not in _cumul_set
+                                    ]
+                                    # Cumulative cap: once decode discovery
+                                    # has added SAGE_MAGNET_DECODE_MAX_CUMULATIVE
+                                    # fraction of ctx_len tokens, stop adding
+                                    # new positions. Lets the caller bound the
+                                    # total decode-time recompute (amortized
+                                    # over decode steps) to a known budget.
+                                    _ctx_len_dd_cap = int(getattr(
+                                        state, "_magnet_dynamic_ctx_len", 0,
+                                    ) or 0)
+                                    _max_cumul = float(os.environ.get(
+                                        "SAGE_MAGNET_DECODE_MAX_CUMULATIVE", "0",
+                                    ))
+                                    if (
+                                        _max_cumul > 0
+                                        and _ctx_len_dd_cap > 0
+                                        and _new_positions
+                                    ):
+                                        _cap_count = int(
+                                            _max_cumul * _ctx_len_dd_cap
+                                        )
+                                        _remaining = max(
+                                            0, _cap_count - len(_cumul_set),
+                                        )
+                                        if len(_new_positions) > _remaining:
+                                            _new_positions = (
+                                                _new_positions[:_remaining]
+                                            )
+                                    if _new_positions:
+                                        _ctx_len_dd = int(getattr(
+                                            state, "_magnet_dynamic_ctx_len", 0,
+                                        ) or 0)
+                                        # Include the suffix (query) positions in
+                                        # the refresh set. Refreshing context K
+                                        # without re-running the suffix leaves
+                                        # suffix K/V stale relative to the new
+                                        # context — same reason pre-TTFT's magnet
+                                        # path unions context_selected with
+                                        # suffix_indices (see
+                                        # _run_magnet_pre_ttft's `selected`
+                                        # construction).
+                                        _new_t = torch.tensor(
+                                            _new_positions,
+                                            dtype=torch.long,
+                                            device=self.device,
+                                        )
+                                        # Optional: include the suffix (query)
+                                        # positions so suffix K/V is re-derived
+                                        # against newly-refreshed context. Costly
+                                        # at every event; gated by env var with
+                                        # default ON (backwards-compatible).
+                                        _refresh_suffix = os.environ.get(
+                                            "SAGE_MAGNET_DECODE_REFRESH_SUFFIX",
+                                            "1",
+                                        ) == "1"
+                                        if (
+                                            _refresh_suffix
+                                            and _ctx_len_dd > 0
+                                            and lmcache_cached_tokens > _ctx_len_dd
+                                        ):
+                                            _suffix_t = torch.arange(
+                                                _ctx_len_dd,
+                                                int(lmcache_cached_tokens),
+                                                device=self.device,
+                                                dtype=torch.long,
+                                            )
+                                            precomputed_imp_indices = torch.cat(
+                                                [_new_t, _suffix_t],
+                                            )
+                                            precomputed_imp_indices = torch.unique(
+                                                precomputed_imp_indices, sorted=True,
+                                            )
+                                        else:
+                                            precomputed_imp_indices = _new_t
+                                        should_blend_this_step = True
+                                        # Set a non-zero step_recompute_ratio so
+                                        # has_precomputed_indices (at the tokenwise
+                                        # fused-inject site) evaluates True and
+                                        # pulls the new positions into the forward.
+                                        # The actual recompute path is shape-driven
+                                        # by len(precomputed_imp_indices); this
+                                        # ratio is just a truthy gate.
+                                        if _ctx_len_dd > 0:
+                                            step_recompute_ratio = (
+                                                float(int(precomputed_imp_indices.numel()))
+                                                / float(_ctx_len_dd)
+                                            )
+                                        else:
+                                            step_recompute_ratio = 1.0
+                                        _cumul_set.update(_new_positions)
+                                        state._magnet_dynamic_cumul_set = _cumul_set
+                                        state._magnet_dynamic_total_discovered = (
+                                            int(getattr(
+                                                state,
+                                                "_magnet_dynamic_total_discovered",
+                                                0,
+                                            )) + len(_new_positions)
+                                        )
+                                    # Emit per-decode-step discovery event so
+                                    # benchmarks can attribute decode-time
+                                    # recompute counts to each request.
+                                    _emit_magnet_selection_event({
+                                        "mode": "decode_discovery",
+                                        "req_id": request.req_id,
+                                        "decode_step": int(state.decode_step),
+                                        "k_new": int(len(_new_positions) if _new_positions else 0),
+                                        "k_total": int(getattr(
+                                            state,
+                                            "_magnet_dynamic_total_discovered",
+                                            0,
+                                        )),
+                                        "k_step_selected": int(_k_step),
+                                    })
+                                    logger.info(
+                                        "[SAGE_MAGNET_DYNAMIC] req=%s "
+                                        "decode_step=%d discovered=%d total=%d "
+                                        "k_step=%d H=%.3f",
+                                        request.req_id, state.decode_step,
+                                        len(_new_positions) if _new_positions else 0,
+                                        int(getattr(
+                                            state,
+                                            "_magnet_dynamic_total_discovered",
+                                            0,
+                                        )),
+                                        _k_step, _H_dec,
+                                    )
+                            elif (
+                                self._sage_method in (
+                                    SageMethod.CACHEBLEND_TOKENWISE,
+                                    SageMethod.MAGNET_INCREMENTAL,
+                                )
                                 and not is_pre_ttft_step
                             ):
                                 if state.frozen_importance_ranking is None:
@@ -2431,16 +3410,18 @@ class LMCacheConnectorV1Impl:
                                         # Already completed (suffix rerecomp done).
                                         should_blend_this_step = False
                                     else:
-                                        # Scoring not done — should not happen
-                                        # (pre-TTFT always scores).
-                                        should_blend_this_step = False
-                                        self._sage_incremental_completed_requests.add(
-                                            request.req_id
-                                        )
-                                        logger.error(
-                                            "[SAGE_PATH] request=%s → SCHED:tokenwise_missing_ranking "
-                                            "(BUG: pre-TTFT scoring should have set this)",
-                                            request.req_id,
+                                        # Scoring not done — pre-TTFT must
+                                        # populate state.frozen_importance_ranking
+                                        # before any decode step runs. Reaching
+                                        # here is a bug: silent degradation
+                                        # would hide broken scoring paths.
+                                        raise RuntimeError(
+                                            f"[SAGE_PATH] request={request.req_id} "
+                                            f"sage_method={self._sage_method.value}: "
+                                            f"decode step reached without "
+                                            f"frozen_importance_ranking. Pre-TTFT "
+                                            f"scoring did not run or failed to "
+                                            f"populate state."
                                         )
                                 else:
                                     step = strategy.next_step(state, self.blender.num_layers)
@@ -2519,10 +3500,26 @@ class LMCacheConnectorV1Impl:
                                         N = int(max(1, lmcache_cached_tokens))
 
                                         # Fixed tokens per step: use the step
-                                        # delta from the strategy (default 5% of N).
+                                        # delta from the strategy.
+                                        # - Tokenwise: step.recompute_ratio is
+                                        #   fraction of total context N, so
+                                        #   tokens_per_step = delta * N.
+                                        # - Magnet-incremental: step.recompute_ratio
+                                        #   is fraction of FULL anchor set |S|.
+                                        #   |S| = pre_ttft_count + total_ranked
+                                        #   (remaining in ranking).
                                         _prev_ratio = getattr(state, "_tw_prev_ratio", 0.0)
                                         _step_delta = step.recompute_ratio - _prev_ratio
-                                        _tokens_per_step = max(1, int(_step_delta * N))
+                                        if self._sage_method == SageMethod.MAGNET_INCREMENTAL:
+                                            _anchor_set_size = (
+                                                int(getattr(state, "pre_ttft_recomputed_tokens", 0))
+                                                + total_ranked
+                                            )
+                                            _tokens_per_step = max(
+                                                1, int(_step_delta * _anchor_set_size),
+                                            )
+                                        else:
+                                            _tokens_per_step = max(1, int(_step_delta * N))
                                         state._tw_prev_ratio = step.recompute_ratio
                                         # Use cursor to track position in ranking
                                         start_idx = int(getattr(state, "_tw_cursor", 0))
@@ -2540,20 +3537,115 @@ class LMCacheConnectorV1Impl:
                                             step_recompute_ratio = (
                                                 float(end_idx) / float(max(1, total_ranked))
                                             )
-                                            state.cumulative_ratio = max(
-                                                state.cumulative_ratio,
-                                                float(
-                                                    int(getattr(state, "pre_ttft_recomputed_tokens", 0))
-                                                    + end_idx
-                                                ) / float(N),
-                                            )
+                                            if self._sage_method == SageMethod.MAGNET_INCREMENTAL:
+                                                # Strategy tracks cumulative_ratio in |S|
+                                                # units (fraction of anchor set);
+                                                # don't overwrite to fraction-of-N
+                                                # semantics.
+                                                pass
+                                            else:
+                                                state.cumulative_ratio = max(
+                                                    state.cumulative_ratio,
+                                                    float(
+                                                        int(getattr(state, "pre_ttft_recomputed_tokens", 0))
+                                                        + end_idx
+                                                    ) / float(N),
+                                                )
+
+                                            # ── Dynamic-discovery: merge new anchors ──
+                                            # Env-gated; runs only for MAGNET_INCREMENTAL
+                                            # when SAGE_MAGNET_DYNAMIC_DISCOVERY=1.
+                                            _new_discovered_count = 0
+                                            if (
+                                                self._sage_method == SageMethod.MAGNET_INCREMENTAL
+                                                and os.environ.get(
+                                                    "SAGE_MAGNET_DYNAMIC_DISCOVERY", "0",
+                                                ) == "1"
+                                            ):
+                                                # Interval gate — see pure-magnet
+                                                # branch above. Uses the same env
+                                                # var so both paths share cadence.
+                                                _score_interval = max(1, int(os.environ.get(
+                                                    "SAGE_MAGNET_DECODE_SCORE_INTERVAL", "1",
+                                                )))
+                                                _dec_step = int(getattr(
+                                                    state, "decode_step", 0,
+                                                ) or 0)
+                                                if _score_interval > 1 and _dec_step % _score_interval != 0:
+                                                    fused_alpha = None
+                                                else:
+                                                    fused_alpha = self._compute_magnet_dynamic_alpha(
+                                                        state, kvcaches,
+                                                    )
+                                                if fused_alpha is not None:
+                                                    _thr = float(getattr(
+                                                        state, "_magnet_dynamic_threshold", 0.005,
+                                                    ))
+                                                    _pre_set = getattr(
+                                                        state, "_magnet_dynamic_pre_ttft_set", set(),
+                                                    )
+                                                    _cumul_set = getattr(
+                                                        state, "_magnet_dynamic_cumul_set", set(),
+                                                    )
+                                                    _quartile_set = set(
+                                                        int(x) for x in precomputed_imp_indices.tolist()
+                                                    )
+                                                    _above = (
+                                                        fused_alpha > _thr
+                                                    ).nonzero(as_tuple=False).flatten().tolist()
+                                                    _new_positions = [
+                                                        int(p) for p in _above
+                                                        if p not in _pre_set
+                                                        and p not in _cumul_set
+                                                        and p not in _quartile_set
+                                                    ]
+                                                    if _new_positions:
+                                                        _new_t = torch.tensor(
+                                                            _new_positions,
+                                                            dtype=precomputed_imp_indices.dtype,
+                                                            device=precomputed_imp_indices.device,
+                                                        )
+                                                        precomputed_imp_indices = torch.cat(
+                                                            [precomputed_imp_indices, _new_t],
+                                                        )
+                                                        precomputed_imp_indices = torch.unique(
+                                                            precomputed_imp_indices, sorted=False,
+                                                        )
+                                                        _cumul_set.update(_new_positions)
+                                                        state._magnet_dynamic_cumul_set = _cumul_set
+                                                        state._magnet_dynamic_total_discovered = (
+                                                            int(getattr(
+                                                                state,
+                                                                "_magnet_dynamic_total_discovered",
+                                                                0,
+                                                            )) + len(_new_positions)
+                                                        )
+                                                    _new_discovered_count = len(_new_positions)
+                                                    logger.info(
+                                                        "[SAGE_MAGNET_DYNAMIC] req=%s "
+                                                        "decode_step=%d new_discovered=%d "
+                                                        "total_discovered=%d above_thr=%d "
+                                                        "quartile=%d merged=%d",
+                                                        request.req_id, state.decode_step,
+                                                        _new_discovered_count,
+                                                        int(getattr(
+                                                            state,
+                                                            "_magnet_dynamic_total_discovered",
+                                                            0,
+                                                        )),
+                                                        len(_above), end_idx - start_idx,
+                                                        int(precomputed_imp_indices.numel()),
+                                                    )
+
                                             logger.info(
                                                 "[SAGE_INCREMENTAL] request=%s tokenwise slice "
-                                                "[%d:%d) of %d M=%d decode_step=%d",
+                                                "[%d:%d) of %d M=%d decode_step=%d "
+                                                "discovered_added=%d",
                                                 request.req_id,
                                                 start_idx, end_idx, total_ranked,
                                                 end_idx - start_idx,
                                                 state.decode_step,
+                                                _new_discovered_count,
                                             )
                         if should_blend_this_step:
                             # Get chunk boundaries to exclude first chunk from candidates.
@@ -2631,7 +3723,17 @@ class LMCacheConnectorV1Impl:
                                 # at any layer yet). Extract at the last
                                 # layer so the inject rows are removed after
                                 # the forward completes.
-                                if self._sage_method == SageMethod.CACHEBLEND_TOKENWISE:
+                                if self._sage_method in (
+                                    SageMethod.CACHEBLEND_TOKENWISE,
+                                    SageMethod.MAGNET_INCREMENTAL,
+                                    SageMethod.MAGNET,
+                                ):
+                                    _prof_on_fi = os.environ.get(
+                                        "SAGE_MAGNET_DECODE_PROFILE", "0",
+                                    ) == "1"
+                                    if _prof_on_fi:
+                                        torch.cuda.synchronize()
+                                        _ts_fi_start = time.perf_counter()
                                     _tw_tids = prompt_tokens[precomputed_imp_indices]
                                     _tw_emb = (
                                         self.blender.layerwise_model
@@ -2649,6 +3751,20 @@ class LMCacheConnectorV1Impl:
                                         "extract_layer": self.blender.num_layers,
                                     }
                                     self._fused_inject_pending[request.req_id] = payload
+                                    if _prof_on_fi:
+                                        torch.cuda.synchronize()
+                                        _state = self._get_or_create_sage_incremental_state(
+                                            request.req_id,
+                                        )
+                                        _state._magnet_prof_fi_setup_s = float(
+                                            getattr(_state, "_magnet_prof_fi_setup_s", 0.0)
+                                        ) + (time.perf_counter() - _ts_fi_start)
+                                        _state._magnet_prof_fi_m_sum = int(
+                                            getattr(_state, "_magnet_prof_fi_m_sum", 0)
+                                        ) + int(precomputed_imp_indices.numel())
+                                        _state._magnet_prof_fi_n = int(
+                                            getattr(_state, "_magnet_prof_fi_n", 0)
+                                        ) + 1
                                     self._sage_pending_blend_launch_t0[request.req_id] = time.perf_counter()
                             if request.req_id not in self._fused_inject_pending:
                                 # If sage_process_layer already scored (MG path),
@@ -2820,6 +3936,26 @@ class LMCacheConnectorV1Impl:
                                             chunk_boundaries=_chunk_bounds,
                                         )
                                 elif (
+                                    self._sage_method == SageMethod.MAGNET_INCREMENTAL
+                                    and is_pre_ttft_step
+                                ):
+                                        # Magnet-incremental-prefill: magnet
+                                        # scoring at pre-TTFT, recompute top
+                                        # pre_ttft_ratio of anchors pre-TTFT,
+                                        # defer remainder to decode steps.
+                                        self._run_magnet_incremental_pre_ttft(
+                                            req_id=request.req_id,
+                                            blend_tokens=blend_tokens,
+                                            sage_token_mask=sage_token_mask,
+                                            blend_slot_mapping=blend_slot_mapping,
+                                            blend_block_table=blend_block_table,
+                                            kvcaches=kvcaches,
+                                            sage_zero_copy=request.sage_blocks_transferred,
+                                            state=state,
+                                            suffix_len=request.query_token_count,
+                                            chunk_boundaries=_chunk_bounds,
+                                        )
+                                elif (
                                     self._sage_method == SageMethod.MAGNET
                                     and not is_pre_ttft_step
                                 ):
@@ -2850,6 +3986,9 @@ class LMCacheConnectorV1Impl:
                                     logger.info(
                                         "[SAGE_PATH] request=%s → EXEC:sync_cacheblend",
                                         request.req_id,
+                                    )
+                                    self._assert_rope_adjusted(
+                                        request.req_id, "sync_cacheblend",
                                     )
                                     self.blender.blend_from_gpu(
                                         blend_tokens,
@@ -2887,6 +4026,7 @@ class LMCacheConnectorV1Impl:
                             "Using CPU-based blending for request %s",
                             request.req_id,
                         )
+                        self._assert_rope_adjusted(request.req_id, "cpu_blend")
                         self.blender.blend(
                             tokens[:lmcache_cached_tokens],
                             token_mask[:lmcache_cached_tokens],
@@ -3196,6 +4336,10 @@ class LMCacheConnectorV1Impl:
         For tokenwise (extract_layer is None), the replay tokens ride to
         the final layer alongside the decode tokens.
 
+        Defensively drains any stragglers from a prior forward that may
+        have errored out before wait_for_save() cleanup ran. Otherwise
+        those stale hooks would fire on this forward and corrupt it.
+
         Returns the updated (input_ids, positions, logits_indices, inputs_embeds)
         for layer-0 input. Note layer 0 still sees the unmodified
         decode-only batch — the replay rows get spliced in later by hooks.
@@ -3203,6 +4347,25 @@ class LMCacheConnectorV1Impl:
         from dataclasses import replace as dc_replace
         from vllm.forward_context import get_forward_context as _get_fwd_ctx
         import time as _time
+
+        # Defensive: drain any stale hook handles left over from a prior
+        # forward that raised before wait_for_save() got to clean up.
+        # Leaving them registered would cause them to fire on this
+        # forward against a completely different batch shape.
+        if self._sage_inject_hook_handles:
+            logger.warning(
+                "[SAGE_HOOK_LEAK] draining %d stale hook handles from a "
+                "previous forward (likely errored before cleanup ran)",
+                len(self._sage_inject_hook_handles),
+            )
+            for _h in self._sage_inject_hook_handles:
+                try:
+                    _h.remove()
+                except Exception as _e:
+                    logger.warning(
+                        "[SAGE_HOOK_LEAK] handle.remove() raised: %s", _e,
+                    )
+            self._sage_inject_hook_handles.clear()
 
         _t_setup_start = _time.perf_counter()
 

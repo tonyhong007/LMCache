@@ -69,8 +69,6 @@ class LMCBlender:
         # The incremental strategy slices this into per-decode-step batches
         # (e.g., tokens ranked 1-500 for step 1, 501-1000 for step 2, etc.).
         self._last_full_importance_ranking: Optional[torch.Tensor] = None
-        # Mean diff_k score from the last scoring step (for adaptive layerwise).
-        self._last_diff_k_mean: Optional[float] = None
         # Layerwise boundary: M-row hidden states saved at end of pre-TTFT
         # pass (blend_from_gpu with save_boundary=True). Allows fused
         # injection to skip already-processed layers during decode.
@@ -163,8 +161,22 @@ class LMCBlender:
                 device=q.device, dtype=torch.long,
             )
             if self.metadata.imp_indices is None:
-                # Slice at check_layer; pass through unchanged before it.
-                if layer_id not in self.common_metadata.check_layers:
+                # Magnet preselection is independent of CacheBlend's
+                # diff_k scoring — once indices are set, every layer
+                # including layer 0 can be restricted to the selected
+                # tokens. Waiting until check_layer wastes a full-context
+                # attention pass at every layer below check_layer.
+                # Env flag lets you revert to the old behaviour for
+                # debugging: SAGE_MAGNET_SLICE_AT_CHECK_LAYER=1.
+                _slice_at_check = (
+                    os.environ.get(
+                        "SAGE_MAGNET_SLICE_AT_CHECK_LAYER", "0"
+                    ) == "1"
+                )
+                if (
+                    _slice_at_check
+                    and layer_id not in self.common_metadata.check_layers
+                ):
                     return q, k, v, residual, attn_output, attn_metadata
                 q = q[top_indices]
                 k = k[top_indices]
@@ -235,7 +247,35 @@ class LMCBlender:
                  - old_k[:non_suffix_len].to(torch.float32)) ** 2,
                 dim=[1],
             )
-            self._last_diff_k_mean = float(diff_k.mean().item())
+            # ── TP fix: diff_k reduces over LOCAL KV heads only. At
+            # TP > 1 each rank produces a different per-token L2 score
+            # because each holds a different head shard. Without an
+            # all-reduce, each rank's topk picks different indices →
+            # Pass 2 slices Q/K/V at different rows on each rank →
+            # incoherent cross-attention → accuracy collapse. SUM
+            # across ranks gives every rank the same global score so
+            # topk picks identical indices everywhere. Same fix as the
+            # magnet path; topk is scale-invariant so no normalize
+            # needed.
+            try:
+                from vllm.distributed import (
+                    get_tensor_model_parallel_world_size, get_tp_group,
+                )
+                _diff_tp_world = get_tensor_model_parallel_world_size()
+            except Exception:
+                _diff_tp_world = 1
+            if _diff_tp_world > 1:
+                try:
+                    import torch.distributed as _dist
+                    _dist.all_reduce(
+                        diff_k, op=_dist.ReduceOp.SUM,
+                        group=get_tp_group().device_group,
+                    )
+                except Exception as _e:
+                    logger.warning(
+                        "[SAGE_TP_FIX] diff_k all_reduce failed (%s); "
+                        "per-rank diff will diverge", _e,
+                    )
             if self.metadata.capture_full_ranking:
                 if candidate_indices is not None:
                     # Filter candidate_indices to non-suffix range
@@ -493,7 +533,6 @@ class LMCBlender:
         self.metadata.imp_indices = None
         self._last_imp_indices = None
         self._last_full_importance_ranking = None
-        self._last_diff_k_mean = None
         max_layers_to_process = int(
             kwargs.get("max_layers_to_process", self.num_layers)
         )

@@ -318,6 +318,95 @@ class MagnetIncrementalBlendStrategy(IncrementalBlendStrategy):
         return step
 
 
+class MagnetIncrementalPrefillStrategy(IncrementalBlendStrategy):
+    """
+    Magnet with amortized reconciliation: query-aware scoring at pre-TTFT,
+    recompute spread across decode steps with a frozen anchor ranking.
+
+    Unlike ``MagnetIncrementalBlendStrategy`` which performs dynamic
+    re-scoring each decode step, this variant:
+      * Computes magnet scoring ONCE at pre-TTFT.
+      * Freezes the ranking of tokens with alpha > threshold.
+      * Recomputes ``pre_ttft_ratio`` of anchors pre-TTFT (the highest-
+        importance slice).
+      * Recomputes the remaining anchors across decode steps in fixed
+        ``step_percent`` chunks, ordered by descending alpha.
+
+    Semantics of ``cumulative_ratio``: fraction of the ANCHOR SET |S|
+    already recomputed (not fraction of context). Adapter must interpret
+    the ratio against ``len(frozen_importance_ranking)``, not against
+    total context length.
+
+    Example with pre_ttft_ratio=0.5, step_percent=0.25:
+      pre-TTFT    -> cumulative 0.50 (top 50% of anchors)
+      decode 1    -> cumulative 0.75 (next 25%)
+      decode 2    -> cumulative 1.00 (final 25%)
+      decode 3+   -> no-op
+    """
+
+    def __init__(self, step_percent: float, max_ratio: float,
+                 threshold: float, pre_ttft_ratio: float):
+        self.step_percent = max(0.0, _normalize_ratio(step_percent))
+        self.max_ratio = _normalize_ratio(max_ratio)
+        self.threshold = max(0.0, float(threshold))
+        self.pre_ttft_ratio = _normalize_ratio(pre_ttft_ratio)
+        logger.info(
+            "[SAGE_INCREMENTAL] Magnet-incremental-prefill strategy "
+            "initialized: threshold=%.6f, pre_ttft_ratio=%.4f, "
+            "step_percent=%.4f, max_ratio=%.4f",
+            self.threshold, self.pre_ttft_ratio,
+            self.step_percent, self.max_ratio,
+        )
+
+    def should_continue(self, state: IncrementalBlendState) -> bool:
+        should_cont = state.cumulative_ratio + 1e-8 < self.max_ratio
+        if not should_cont:
+            logger.info(
+                "[SAGE_INCREMENTAL] Magnet-incremental-prefill budget "
+                "exhausted: decode_step=%d, cumulative_ratio=%.4f, "
+                "max_ratio=%.4f",
+                state.decode_step, state.cumulative_ratio, self.max_ratio,
+            )
+        return should_cont
+
+    def next_step(self, state: IncrementalBlendState,
+                  num_layers: int) -> IncrementalBlendStep:
+        del num_layers
+        state.decode_step += 1
+        if not self.should_continue(state):
+            step = IncrementalBlendStep(
+                should_blend=False,
+                reason="magnet-incremental-prefill budget exhausted",
+            )
+            logger.info("[SAGE_INCREMENTAL] %s", step.reason)
+            return step
+
+        next_ratio = min(
+            self.max_ratio,
+            state.cumulative_ratio + self.step_percent,
+        )
+        if next_ratio <= state.cumulative_ratio + 1e-8:
+            step = IncrementalBlendStep(
+                should_blend=False,
+                reason="magnet-incremental-prefill ratio did not increase",
+            )
+            logger.info("[SAGE_INCREMENTAL] %s", step.reason)
+            return step
+
+        state.cumulative_ratio = next_ratio
+        step = IncrementalBlendStep(
+            should_blend=True,
+            recompute_ratio=state.cumulative_ratio,
+            reason=(
+                f"magnet-incremental-prefill decode_step={state.decode_step}, "
+                f"delta={self.step_percent:.4f}, "
+                f"cumulative_ratio={state.cumulative_ratio:.4f}"
+            ),
+        )
+        logger.info("[SAGE_INCREMENTAL] %s", step.reason)
+        return step
+
+
 def build_incremental_blend_strategy(config) -> Optional[IncrementalBlendStrategy]:
     strategy_name = (
         getattr(config, "blend_incremental_strategy", None) or "none"
@@ -362,12 +451,32 @@ def build_incremental_blend_strategy(config) -> Optional[IncrementalBlendStrateg
             max_ratio=float(max_ratio),
         )
 
+    if strategy_name in (
+        "magnet_incremental", "magnet-incremental",
+        "magnet_incremental_prefill", "magnet-incremental-prefill",
+    ):
+        threshold = float(os.environ.get("SAGE_MAGNET_THRESHOLD", "0.08"))
+        pre_ttft_ratio = float(os.environ.get(
+            "SAGE_MAGNET_INCREMENTAL_PRE_TTFT_RATIO", "0.5"
+        ))
+        step_percent = float(os.environ.get(
+            "SAGE_MAGNET_INCREMENTAL_STEP_PERCENT", "0.25"
+        ))
+        return MagnetIncrementalPrefillStrategy(
+            step_percent=step_percent,
+            max_ratio=float(max_ratio),
+            threshold=threshold,
+            pre_ttft_ratio=pre_ttft_ratio,
+        )
+
     logger.error(
         "[SAGE_INCREMENTAL] Unsupported incremental strategy '%s'. "
-        "Supported values: none, token_wise, layer_wise, magnet.",
+        "Supported values: none, token_wise, layer_wise, magnet, "
+        "magnet_incremental.",
         strategy_name,
     )
     raise ValueError(
         f"Unknown blend incremental strategy '{strategy_name}'. "
-        "Supported values: none, token_wise, layer_wise, magnet."
+        "Supported values: none, token_wise, layer_wise, magnet, "
+        "magnet_incremental."
     )

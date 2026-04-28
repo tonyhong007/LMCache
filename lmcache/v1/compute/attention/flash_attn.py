@@ -48,6 +48,11 @@ class LMCFlashAttnBackend(AttentionInterface):
     ) -> torch.Tensor:
         assert isinstance(attn_metadata, LMCFlashAttnMetadata)
 
+        if attn_metadata.attn_mask_bool is not None:
+            return self._position_aware_attention(
+                query, key, value, output, attn_metadata,
+            )
+
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
         cu_seqlens_k = attn_metadata.cu_seqlens_k
@@ -90,6 +95,44 @@ class LMCFlashAttnBackend(AttentionInterface):
             v_descale=self.vllm_attn._v_scale.expand(descale_shape),
         )
 
+        return output
+
+    def _position_aware_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        m: LMCFlashAttnMetadata,
+    ) -> torch.Tensor:
+        """Scattered-slice causal attention via SDPA + cached mask.
+
+        query: [Tp, H_q, D], key/value: [N, H_kv, D]. The bool mask
+        lives on metadata (built once at check_layer) so every layer
+        reuses it. K/V are repeat_interleaved up to H_q because
+        enable_gqa=True forces SDPA to the math backend.
+        """
+        import torch.nn.functional as F
+        H_q = query.shape[1]
+        H_kv = key.shape[1]
+        group = H_q // H_kv
+        # [Tp, H_q, D] -> [1, H_q, Tp, D]
+        q_sdpa = query.transpose(0, 1).unsqueeze(0)
+        # [N, H_kv, D] -> [1, H_kv, N, D]
+        k_sdpa = key.transpose(0, 1).unsqueeze(0)
+        v_sdpa = value.transpose(0, 1).unsqueeze(0)
+        if group > 1:
+            k_sdpa = k_sdpa.repeat_interleave(group, dim=1)
+            v_sdpa = v_sdpa.repeat_interleave(group, dim=1)
+        attn_out = F.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa,
+            attn_mask=m.attn_mask_bool,
+            is_causal=False,
+            scale=self.vllm_attn_impl.scale,
+        )
+        # Back to [Tp, H_q, D]
+        attn_out = attn_out.squeeze(0).transpose(0, 1).to(query.dtype)
+        output.copy_(attn_out)
         return output
 
     def _schedule(
