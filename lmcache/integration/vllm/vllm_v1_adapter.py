@@ -949,14 +949,39 @@ class LMCacheConnectorV1Impl:
         self._sage_incremental_completed_requests.discard(req_id)
         self._fused_inject_pending.pop(req_id, None)
         self._fused_inject_active.discard(req_id)
-        # Clear Q ring buffer so the next request starts with fresh Qs
-        # (the buffer is adapter-global; without clearing, a new
-        # request's first few scored events would mix in the previous
-        # request's decode Qs).
-        _q_win = getattr(self, "_magnet_dynamic_q_window_per_layer", None)
-        if _q_win is not None:
-            for _lid in list(_q_win.keys()):
-                _q_win[_lid].clear()
+        # The Q ring buffer and per-layer Q dict are adapter-global (the
+        # hooks fire for every batch-1 decode forward, regardless of req).
+        # Only clear them if the finishing request is the most recent
+        # consumer ("owner") — otherwise we'd wipe Qs that another active
+        # request just captured for its next score.
+        _owner = getattr(self, "_magnet_dynamic_q_owner_req_id", None)
+        if _owner is None or _owner == req_id:
+            _q_win = getattr(self, "_magnet_dynamic_q_window_per_layer", None)
+            if _q_win is not None:
+                for _lid in list(_q_win.keys()):
+                    _q_win[_lid].clear()
+            _q_full = getattr(self, "_magnet_dynamic_q_per_layer", None)
+            if _q_full is not None:
+                _q_full.clear()
+            self._magnet_dynamic_q_owner_req_id = None
+        # Cached prompt embeds/positions from start_early_blend leak on
+        # abort if not popped here.
+        _emb = getattr(self, "_cached_prompt_embeds", None)
+        if _emb is not None:
+            _emb.pop(req_id, None)
+        _pos = getattr(self, "_cached_prompt_positions", None)
+        if _pos is not None:
+            _pos.pop(req_id, None)
+        # Drop any boundary tensors the shared blender still holds — same
+        # set the warmup path clears for the same reason.
+        try:
+            self.blender._scoring_boundary_hidden = None
+            self.blender._scoring_boundary_residual = None
+            self.blender._scoring_boundary_pos_to_row = None
+            self.blender._scoring_boundary_layer = None
+            self.blender._last_imp_indices = None
+        except Exception:
+            pass
 
     def _mark_sage_recompute_completed(
         self,
@@ -1906,6 +1931,7 @@ class LMCacheConnectorV1Impl:
         self,
         state: Any,
         kvcaches: list,
+        req_id: Optional[str] = None,
     ) -> Optional["torch.Tensor"]:
         """Compute ProphetKV fused α using the Q's captured by hooks
         during the most recent decode forward.
@@ -1933,6 +1959,13 @@ class LMCacheConnectorV1Impl:
         q_per_layer = getattr(self, "_magnet_dynamic_q_per_layer", None)
         if not q_per_layer:
             return None
+        # Claim ownership of the captured Qs. The hooks are adapter-global,
+        # so any req's decode forward overwrites the dict; the request that
+        # most recently consumed the Qs owns them and is the only one whose
+        # cleanup may free them. Without this, finishing req A would wipe
+        # Qs that req B captured for its next score.
+        if req_id is not None:
+            self._magnet_dynamic_q_owner_req_id = req_id
         # Sliding-window aggregation: if SAGE_MAGNET_DECODE_WINDOW > 1,
         # replace each layer's latest Q with the mean over the ring
         # buffer of recent Qs. Selects tokens that have been
@@ -3194,7 +3227,7 @@ class LMCacheConnectorV1Impl:
                                         torch.cuda.synchronize()
                                         _ts_score_start = time.perf_counter()
                                     fused_alpha = self._compute_magnet_dynamic_alpha(
-                                        state, kvcaches,
+                                        state, kvcaches, request.req_id,
                                     )
                                     if _prof_on:
                                         torch.cuda.synchronize()
@@ -3575,7 +3608,7 @@ class LMCacheConnectorV1Impl:
                                                     fused_alpha = None
                                                 else:
                                                     fused_alpha = self._compute_magnet_dynamic_alpha(
-                                                        state, kvcaches,
+                                                        state, kvcaches, request.req_id,
                                                     )
                                                 if fused_alpha is not None:
                                                     _thr = float(getattr(
