@@ -36,14 +36,8 @@ class LMCFlashAttnMetadata(LMCAttnMetadata):
         device = self.query_start_loc.device
         dtype = self.query_start_loc.dtype
         self.query_start_loc = torch.tensor([0, top_k_num], dtype=dtype, device=device)
-        self.original_q_positions = top_indices.detach().clone()
-
-        max_seq_len = self.max_seq_len
-        N = int(max_seq_len) if isinstance(max_seq_len, int) \
-            else int(max_seq_len.item())
-        key_idx = torch.arange(N, device=device)
-        allowed = key_idx.unsqueeze(0) <= top_indices.unsqueeze(1)  # [Tp, N]
-        self.attn_mask_bool = allowed.unsqueeze(0).unsqueeze(0)
+        self.attn_mask_bool = None
+        self.original_q_positions = None
 
 
 @dataclass
