@@ -161,16 +161,9 @@ class LMCBlender:
                 device=q.device, dtype=torch.long,
             )
             if self.metadata.imp_indices is None:
-                # Magnet preselection is independent of CacheBlend's
-                # diff_k scoring — once indices are set, every layer
-                # including layer 0 can be restricted to the selected
-                # tokens. Waiting until check_layer wastes a full-context
-                # attention pass at every layer below check_layer.
-                # Env flag lets you revert to the old behaviour for
-                # debugging: SAGE_MAGNET_SLICE_AT_CHECK_LAYER=1.
                 _slice_at_check = (
                     os.environ.get(
-                        "SAGE_MAGNET_SLICE_AT_CHECK_LAYER", "0"
+                        "SAGE_MAGNET_SLICE_AT_CHECK_LAYER", "1"
                     ) == "1"
                 )
                 if (
@@ -219,7 +212,13 @@ class LMCBlender:
                 self.metadata.imp_indices = top_indices
                 self.metadata.positions = self.metadata.positions[top_indices]
                 attn_output = attn_output[:top_indices.shape[0]]
-                attn_metadata.update_from_top_indices(top_indices)
+                _cb_use_sdpa = (
+                    os.environ.get("LMCACHE_CACHEBLEND_USE_SDPA_MASK", "0")
+                    == "1"
+                )
+                attn_metadata.update_from_top_indices(
+                    top_indices, skip_dense_mask=not _cb_use_sdpa,
+                )
                 self._last_imp_indices = top_indices.detach().clone()
                 old_k[top_indices] = k
                 old_v[top_indices] = v
@@ -334,7 +333,13 @@ class LMCBlender:
             self.metadata.imp_indices = top_indices
             self.metadata.positions = self.metadata.positions[top_indices]
             attn_output = attn_output[:len(top_indices)]
-            attn_metadata.update_from_top_indices(top_indices)
+            _cb_use_sdpa = (
+                os.environ.get("LMCACHE_CACHEBLEND_USE_SDPA_MASK", "0")
+                == "1"
+            )
+            attn_metadata.update_from_top_indices(
+                top_indices, skip_dense_mask=not _cb_use_sdpa,
+            )
             self._last_imp_indices = self.metadata.imp_indices.detach().clone()
             if timing_enabled:
                 if q.is_cuda:

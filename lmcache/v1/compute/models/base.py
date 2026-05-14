@@ -42,7 +42,7 @@ def _magnet_alpha_block(
         "qkgd,nkd->kgqn", q_grouped, k_ctx_heads,
     ) * scale
     probs = torch.softmax(logits.float(), dim=-1)
-    return probs.mean(dim=(0, 1, 2))
+    return probs.sum(dim=2).mean(dim=(0, 1))
 
 class LMCBaseModel(nn.Module, ABC):
     def __init__(
@@ -303,16 +303,6 @@ class LMCBaseModel(nn.Module, ABC):
             v_view = v_full.view(context_len + Q_s, num_kv_heads, head_dim)
             q_h = q.view(Q_s, num_heads, head_dim)
 
-            _layer_sw = getattr(
-                self.vllm_attn_layers[idx].impl, "sliding_window", None,
-            )
-            if _layer_sw is None or (
-                isinstance(_layer_sw, tuple) and _layer_sw[0] < 0
-            ):
-                _window_size = (-1, -1)
-            else:
-                _window_size = (int(_layer_sw[0]), int(_layer_sw[1]))
-
             attn_out = flash_attn_varlen_func(
                 q=q_h,
                 k=k_view,
@@ -323,7 +313,6 @@ class LMCBaseModel(nn.Module, ABC):
                 max_seqlen_k=context_len + Q_s,
                 softmax_scale=scale,
                 causal=True,
-                window_size=_window_size,
             )
             attn_out = attn_out.reshape(Q_s, num_heads * head_dim).to(q.dtype)
 
