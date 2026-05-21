@@ -512,6 +512,13 @@ class LMCacheConnectorV1Impl:
     # Used to propagate early_blend_done from sage_process_layer (WORKER adapter)
     # to the blend_from_gpu check (SCHEDULER adapter).
     _shared_early_blend_done: dict[str, bool] = {}
+    # parent_request_id -> list[MultiModalFeatureSpec]. Class-level so
+    # the scheduler-side instance (where update_state_after_alloc runs)
+    # and the worker-side instance (where _stash_mm_for_blender reads)
+    # share the same store. Populated for any request whose mm_features
+    # are non-empty (parents assembled from SAGE chunks have merged
+    # mm_features).
+    _shared_mm_features_by_parent: dict[str, list] = {}
 
     def __init__(
         self,
@@ -1046,6 +1053,119 @@ class LMCacheConnectorV1Impl:
         result_np = actual_block_id * block_size + pos_in_block
 
         return torch.from_numpy(result_np).to(device=device, dtype=torch.int64)
+
+    def _stash_mm_for_blender(self, request, blend_tokens) -> bool:
+        """Stash multimodal embeddings on the model so the blender's
+        compute_layer can pass them to embed_input_ids.
+
+        The blender's `compute_layer` calls `embed_input_ids(input_ids)`
+        which is just a vocab lookup — vision_pad tokens get noise.
+        For multimodal requests, we precompute the mm embeddings (concat
+        of all chunks' video_embeds, in mm_position order) and a bool
+        is_multimodal mask of length len(blend_tokens), then stash both
+        on the vllm_model via private attributes that compute_layer
+        looks for.
+
+        Returns True if mm was stashed (i.e., request has video data),
+        False otherwise. Caller must call _unstash_mm_for_blender after
+        the blend completes.
+        """
+        mm_features = getattr(request, "mm_features", None)
+        # ReqMeta doesn't carry mm_features. Look it up from the
+        # class-level shared store populated by update_state_after_alloc.
+        if not mm_features:
+            mm_features = (
+                LMCacheConnectorV1Impl._shared_mm_features_by_parent.get(
+                    getattr(request, "req_id", None)
+                )
+            )
+        if not mm_features:
+            return False
+        # Concat all video embeddings in position order. is_multimodal
+        # mask is True wherever the prompt has a vision_pad position
+        # (per each feature's mm_position.is_embed sub-mask).
+        import torch as _torch
+        feats = sorted(mm_features, key=lambda f: f.mm_position.offset)
+        emb_tensors = []
+        N = int(blend_tokens.shape[0])
+        is_mm = _torch.zeros(N, dtype=_torch.bool, device=blend_tokens.device)
+        for feat in feats:
+            data = feat.data
+            if "video_embeds" in data:
+                emb_tensors.append(data["video_embeds"].data.cuda())
+            elif "image_embeds" in data:
+                emb_tensors.append(data["image_embeds"].data.cuda())
+            else:
+                # No precomputed embeds (would need to call encoder
+                # ourselves) — skip stash, blender uses default path.
+                return False
+            pos = feat.mm_position
+            if pos.is_embed is not None:
+                local_mask = pos.is_embed.to(blend_tokens.device)
+                end = min(pos.offset + pos.length, N)
+                seg_len = end - pos.offset
+                if seg_len > 0:
+                    is_mm[pos.offset : end] |= local_mask[:seg_len]
+        if not emb_tensors:
+            return False
+        full_embeds = _torch.cat(emb_tensors, dim=0)
+        model = self.blender.layerwise_model.vllm_model
+        model._lmcache_blender_mm_embeds = full_embeds
+        model._lmcache_blender_is_mm = is_mm
+        # M-RoPE positions: prefer the bench-side precomputed value
+        # (computed on the FULL un-chunked mm_features where
+        # iter_mm_grid_hw works correctly), falling back to compute
+        # over the merged chunks (which may overflow on chunk gaps).
+        precomp = getattr(
+            LMCacheConnectorV1Impl, "_shared_mrope_positions", {},
+        ).get(getattr(request, "req_id", None))
+        if precomp is not None:
+            model._lmcache_mrope_positions = precomp.to(
+                blend_tokens.device,
+            )
+            logger.info(
+                "[SAGE_MM_BLENDER] using precomputed mrope_positions: "
+                "shape=%s for req=%s",
+                tuple(precomp.shape), request.req_id,
+            )
+        else:
+            outer = getattr(model, "_lmcache_outer_mm_model", None)
+            if outer is not None and hasattr(
+                outer, "get_mrope_input_positions"
+            ):
+                try:
+                    mrope_pos, _delta = outer.get_mrope_input_positions(
+                        blend_tokens.cpu().tolist(),
+                        feats,
+                    )
+                    model._lmcache_mrope_positions = mrope_pos
+                    logger.info(
+                        "[SAGE_MM_BLENDER] stashed mrope_positions: "
+                        "shape=%s",
+                        tuple(mrope_pos.shape),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[SAGE_MM_BLENDER] mrope_positions computation "
+                        "failed: %s: %s — falling back to 1D arange",
+                        type(e).__name__, e,
+                    )
+        logger.info(
+            "[SAGE_MM_BLENDER] stashed mm embeds: shape=%s is_mm_count=%d "
+            "for request=%s",
+            tuple(full_embeds.shape), int(is_mm.sum()), request.req_id,
+        )
+        return True
+
+    def _unstash_mm_for_blender(self) -> None:
+        model = self.blender.layerwise_model.vllm_model
+        for attr in (
+            "_lmcache_blender_mm_embeds",
+            "_lmcache_blender_is_mm",
+            "_lmcache_mrope_positions",
+        ):
+            if hasattr(model, attr):
+                delattr(model, attr)
 
     def _assert_rope_adjusted(self, req_id: str, context: str) -> None:
         """Guard any blend/recompute entry against a stale layer-0 K.
@@ -3956,18 +4076,30 @@ class LMCacheConnectorV1Impl:
                                             "[SAGE_PATH] request=%s → EXEC:magnet_pre_ttft",
                                             request.req_id,
                                         )
-                                        self._run_magnet_pre_ttft(
-                                            req_id=request.req_id,
-                                            blend_tokens=blend_tokens,
-                                            sage_token_mask=sage_token_mask,
-                                            blend_slot_mapping=blend_slot_mapping,
-                                            blend_block_table=blend_block_table,
-                                            kvcaches=kvcaches,
-                                            sage_zero_copy=request.sage_blocks_transferred,
-                                            state=state,
-                                            suffix_len=request.query_token_count,
-                                            chunk_boundaries=_chunk_bounds,
+                                        # Multimodal: stash mm embeds + M-RoPE
+                                        # positions (same as sync_cacheblend path)
+                                        # so the blender's recompute uses
+                                        # correct vision embeddings and 3D
+                                        # positional encoding.
+                                        _mm_set = self._stash_mm_for_blender(
+                                            request, blend_tokens,
                                         )
+                                        try:
+                                            self._run_magnet_pre_ttft(
+                                                req_id=request.req_id,
+                                                blend_tokens=blend_tokens,
+                                                sage_token_mask=sage_token_mask,
+                                                blend_slot_mapping=blend_slot_mapping,
+                                                blend_block_table=blend_block_table,
+                                                kvcaches=kvcaches,
+                                                sage_zero_copy=request.sage_blocks_transferred,
+                                                state=state,
+                                                suffix_len=request.query_token_count,
+                                                chunk_boundaries=_chunk_bounds,
+                                            )
+                                        finally:
+                                            if _mm_set:
+                                                self._unstash_mm_for_blender()
                                 elif (
                                     self._sage_method == SageMethod.MAGNET_INCREMENTAL
                                     and is_pre_ttft_step
@@ -4023,17 +4155,30 @@ class LMCacheConnectorV1Impl:
                                     self._assert_rope_adjusted(
                                         request.req_id, "sync_cacheblend",
                                     )
-                                    self.blender.blend_from_gpu(
-                                        blend_tokens,
-                                        blend_token_mask,
-                                        step_recompute_ratio=step_recompute_ratio,
-                                        suffix_len=request.query_token_count,
-                                        include_suffix=True,
-                                        kvcaches=kvcaches,
-                                        slot_mapping=blend_slot_mapping,
-                                        block_table=blend_block_table,
-                                        sage_zero_copy=request.sage_blocks_transferred,
+                                    # Multimodal recompute: stash mm
+                                    # embeddings on the model so the
+                                    # blender's compute_layer can pass
+                                    # them to embed_input_ids (otherwise
+                                    # vision_pad tokens get vocab
+                                    # garbage during recompute).
+                                    _mm_set = self._stash_mm_for_blender(
+                                        request, blend_tokens,
                                     )
+                                    try:
+                                        self.blender.blend_from_gpu(
+                                            blend_tokens,
+                                            blend_token_mask,
+                                            step_recompute_ratio=step_recompute_ratio,
+                                            suffix_len=request.query_token_count,
+                                            include_suffix=True,
+                                            kvcaches=kvcaches,
+                                            slot_mapping=blend_slot_mapping,
+                                            block_table=blend_block_table,
+                                            sage_zero_copy=request.sage_blocks_transferred,
+                                        )
+                                    finally:
+                                        if _mm_set:
+                                            self._unstash_mm_for_blender()
                                     self._sage_incremental_completed_requests.add(
                                         request.req_id
                                     )
@@ -5633,6 +5778,21 @@ class LMCacheConnectorV1Impl:
             num_external_tokens,
         )
         self.lookup_client.clear_lookup_status(request.request_id)
+
+        # Capture parent's merged mm_features for SAGE multimodal blender.
+        # Parents (assembled from chunks) carry merged_mm_features; chunks
+        # carry their own slices. We index by request_id which is also the
+        # parent_request_id used downstream by the SAGE blender path.
+        mm_feats = getattr(request, "mm_features", None)
+        if mm_feats:
+            LMCacheConnectorV1Impl._shared_mm_features_by_parent[
+                request.request_id
+            ] = list(mm_feats)
+            logger.info(
+                "[SAGE_MM_BLENDER] recorded mm_features for %s "
+                "(count=%d)",
+                request.request_id, len(mm_feats),
+            )
 
         kv_transfer_params = (
             request.kv_transfer_params

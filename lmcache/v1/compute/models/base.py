@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -99,7 +100,34 @@ class LMCBaseModel(nn.Module, ABC):
         input_ids: torch.Tensor,
     ):
         input_ids = input_ids.cuda()
-        hidden_states = self.vllm_model.embed_input_ids(input_ids)
+        # Multimodal substitution side-channel: when SAGE blender is
+        # rerunning the model on a multimodal prompt, the adapter sets
+        # `_lmcache_blender_mm_embeds` and `_lmcache_blender_is_mm` on
+        # the vllm_model so that vision_pad tokens get their proper
+        # encoder embeddings instead of meaningless text vocab lookups.
+        # Without this, recompute corrupts vision-token KV at any ratio
+        # > 0 because vocab embeddings for `<|video_pad|>` are noise.
+        mm_embeds = getattr(self.vllm_model, "_lmcache_blender_mm_embeds", None)
+        is_mm = getattr(self.vllm_model, "_lmcache_blender_is_mm", None)
+        outer = getattr(self.vllm_model, "_lmcache_outer_mm_model", None)
+        if (
+            outer is not None
+            and mm_embeds is not None
+            and is_mm is not None
+        ):
+            # Use the outer multimodal wrapper's embed_input_ids — this
+            # handles both vision-token substitution and deepstack
+            # feature injection (via _set_deepstack_input_embeds), which
+            # the inner LM's embed_input_ids cannot do.
+            mm_embeds_dev = mm_embeds.to(input_ids.device)
+            is_mm_dev = is_mm.to(input_ids.device)
+            hidden_states = outer.embed_input_ids(
+                input_ids,
+                multimodal_embeddings=(mm_embeds_dev,),
+                is_multimodal=is_mm_dev,
+            )
+        else:
+            hidden_states = self.vllm_model.embed_input_ids(input_ids)
         residual = None
 
         attn_output = None
@@ -112,6 +140,23 @@ class LMCBaseModel(nn.Module, ABC):
             self.vllm_model.model.start_layer : self.vllm_model.model.end_layer
         ]
         last_layer_idx = len(layers) - 1
+
+        # DEBUG: track hidden_states magnitudes at key layers + suffix
+        # tokens to spot where chunked recompute diverges from baseline.
+        _dbg = os.environ.get("LMC_DEBUG_HS", "0") == "1"
+        if _dbg:
+            n = hidden_states.shape[0]
+            sfx_len = 16  # match probe's suffix_len
+            sfx_start = max(0, n - sfx_len)
+            logger.info(
+                "[DBG_HS] L0_pre n=%d hs_mean_abs=%.4f sfx_mean_abs=%.4f "
+                "outer=%s mm_set=%s",
+                n,
+                hidden_states.abs().mean().item(),
+                hidden_states[sfx_start:].abs().mean().item(),
+                "yes" if outer is not None else "no",
+                "yes" if (mm_embeds is not None and is_mm is not None) else "no",
+            )
 
         for idx, layer in enumerate(layers):
             # Self Attention
@@ -166,6 +211,17 @@ class LMCBaseModel(nn.Module, ABC):
                 hidden_states, residual
             )
             hidden_states = layer.mlp(hidden_states)
+
+            if _dbg and idx in (0, last_layer_idx // 2, last_layer_idx):
+                n_dbg = hidden_states.shape[0]
+                sfx_start_dbg = max(0, n_dbg - 16)
+                logger.info(
+                    "[DBG_HS] L%d_post hs_mean_abs=%.4f sfx_mean_abs=%.4f",
+                    idx,
+                    hidden_states.abs().mean().item(),
+                    hidden_states[sfx_start_dbg:].abs().mean().item(),
+                )
+
             self._layerwise_out_hidden = hidden_states
             self._layerwise_out_residual = residual
 

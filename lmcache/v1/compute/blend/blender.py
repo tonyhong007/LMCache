@@ -134,9 +134,59 @@ class LMCBlender:
 
         # perform positional encoding
         if self.metadata.positions is None:
-            self.metadata.positions = torch.arange(
-                q.shape[0], device=q.device, dtype=torch.int64
+            # SAGE blender on multimodal models (e.g., Qwen3-VL) needs
+            # the model's M-RoPE 3D positions (text_pos, h, w), not a
+            # 1D arange. The adapter stashes them via
+            # `_lmcache_mrope_positions` before calling blend_from_gpu;
+            # we pick them up here if present.
+            stashed = getattr(
+                self.layerwise_model.vllm_model,
+                "_lmcache_mrope_positions",
+                None,
             )
+            if stashed is not None:
+                # Ensure contiguous and on the right device.
+                self.metadata.positions = stashed.to(
+                    q.device, dtype=torch.int64,
+                ).contiguous()
+                # Diagnostic: dump first/last 8 positions of each axis.
+                if os.environ.get("LMC_DEBUG_MROPE", "0") == "1":
+                    p = self.metadata.positions
+                    for axis in range(p.shape[0]):
+                        head = p[axis, :8].tolist()
+                        tail = p[axis, -8:].tolist()
+                        logger.info(
+                            "[BLENDER_POS] axis %d head=%s tail=%s",
+                            axis, head, tail,
+                        )
+                if os.environ.get("LMC_DEBUG_MROPE", "0") == "1":
+                    p = self.metadata.positions
+                    re = self.layerwise_model.vllm_model.model.layers[
+                        layer_id
+                    ].self_attn.rotary_emb
+                    cache = getattr(re, "cos_sin_cache", None)
+                    cache_shape = (
+                        tuple(cache.shape) if cache is not None else None
+                    )
+                    section = getattr(re, "mrope_section", None)
+                    logger.info(
+                        "[BLENDER_POS] mrope shape=%s dtype=%s "
+                        "min=%d max=%d q_len=%d q_shape=%s k_shape=%s "
+                        "rotary_emb=%s cache_shape=%s section=%s",
+                        tuple(p.shape), p.dtype,
+                        int(p.min()), int(p.max()),
+                        q.shape[0], tuple(q.shape), tuple(k.shape),
+                        type(re).__name__, cache_shape, section,
+                    )
+            else:
+                self.metadata.positions = torch.arange(
+                    q.shape[0], device=q.device, dtype=torch.int64
+                )
+                if os.environ.get("LMC_DEBUG_MROPE", "0") == "1":
+                    logger.info(
+                        "[BLENDER_POS] FALLBACK to 1D arange q_len=%d",
+                        q.shape[0],
+                    )
         layer = self.layerwise_model.vllm_model.model.layers[layer_id]
         attn_layer = layer.self_attn
 
@@ -177,7 +227,16 @@ class LMCBlender:
                 residual = residual[top_indices]
                 self.metadata.imp_indices = top_indices
                 if self.metadata.positions is not None:
-                    self.metadata.positions = self.metadata.positions[top_indices]
+                    # Positions can be 1D (text RoPE) or 2D (M-RoPE: (3, N)).
+                    # Slice along the token axis in both cases.
+                    if self.metadata.positions.ndim == 1:
+                        self.metadata.positions = (
+                            self.metadata.positions[top_indices]
+                        )
+                    else:
+                        self.metadata.positions = (
+                            self.metadata.positions[:, top_indices]
+                        )
                 attn_output = attn_output[:top_indices.shape[0]]
                 attn_metadata.update_from_top_indices(top_indices)
                 self._last_imp_indices = top_indices.detach().clone()
@@ -210,7 +269,12 @@ class LMCBlender:
                 q = q[top_indices]
                 residual = residual[top_indices]
                 self.metadata.imp_indices = top_indices
-                self.metadata.positions = self.metadata.positions[top_indices]
+                # Positions can be 1D (text RoPE) or 2D (M-RoPE: (3, N)).
+                # Slice along the token axis in both cases.
+                if self.metadata.positions.ndim == 1:
+                    self.metadata.positions = self.metadata.positions[top_indices]
+                else:
+                    self.metadata.positions = self.metadata.positions[:, top_indices]
                 attn_output = attn_output[:top_indices.shape[0]]
                 _cb_use_sdpa = (
                     os.environ.get("LMCACHE_CACHEBLEND_USE_SDPA_MASK", "0")
@@ -331,7 +395,10 @@ class LMCBlender:
             residual = residual[top_indices]
 
             self.metadata.imp_indices = top_indices
-            self.metadata.positions = self.metadata.positions[top_indices]
+            if self.metadata.positions.ndim == 1:
+                self.metadata.positions = self.metadata.positions[top_indices]
+            else:
+                self.metadata.positions = self.metadata.positions[:, top_indices]
             attn_output = attn_output[:len(top_indices)]
             _cb_use_sdpa = (
                 os.environ.get("LMCACHE_CACHEBLEND_USE_SDPA_MASK", "0")
